@@ -76,6 +76,11 @@ import { confirmActivateCertificateTool } from './confirmActivateCertificateTool
 import { activateCertificateTool } from './activateCertificateTool.js'
 import { confirmDeleteCertificateTool } from './confirmDeleteCertificateTool.js'
 import { deleteCertificateTool } from './deleteCertificateTool.js'
+// WordPress tools
+import { confirmInstallWordPressTool } from './confirmInstallWordPressTool.js'
+import { installWordPressTool } from './installWordPressTool.js'
+import { confirmUninstallWordPressTool } from './confirmUninstallWordPressTool.js'
+import { uninstallWordPressTool } from './uninstallWordPressTool.js'
 // Import other tools here as you add them
 
 // Categorize tools based on their functionality
@@ -153,6 +158,11 @@ export const forgeTools = [
   createLetsEncryptCertificateTool,
   confirmActivateCertificateTool,
   activateCertificateTool,
+  // WordPress tools
+  confirmInstallWordPressTool,
+  installWordPressTool,
+  confirmUninstallWordPressTool,
+  uninstallWordPressTool,
 
   // DESTRUCTIVE TOOLS (Deletion) - UNDER DEVELOPMENT
   // These tools are currently disabled due to the high risk involved in destructive operations.
