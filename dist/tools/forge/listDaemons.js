@@ -1,0 +1,40 @@
+import { HttpMethod } from '../../core/types/protocols.js';
+import { callForgeApi } from '../../utils/forgeApi.js';
+import { toMCPToolResult, toMCPToolError } from '../../utils/mcpToolResult.js';
+import { z } from 'zod';
+const paramsSchema = {
+    serverId: z.string().describe('The ID of the server to list daemons for.'),
+};
+const paramsZodObject = z.object(paramsSchema);
+export const listDaemonsTool = {
+    name: 'list_daemons',
+    parameters: paramsSchema,
+    annotations: {
+        title: 'List Daemons',
+        description: 'List all daemons on a specific server in your Laravel Forge account.',
+        operation: 'list',
+        resource: 'daemons',
+        safe: true,
+        readOnlyHint: true,
+        openWorldHint: true,
+        readWriteHint: false,
+        destructiveHint: false
+    },
+    handler: async (params, forgeApiKey) => {
+        const parsed = paramsZodObject.parse(params);
+        const serverId = parsed.serverId;
+        if (!serverId) {
+            return toMCPToolError(new Error('Missing required parameter: serverId'));
+        }
+        try {
+            const data = await callForgeApi({
+                endpoint: `/servers/${String(serverId)}/daemons`,
+                method: HttpMethod.GET,
+            }, forgeApiKey);
+            return toMCPToolResult(data);
+        }
+        catch (err) {
+            return toMCPToolError(err);
+        }
+    },
+};

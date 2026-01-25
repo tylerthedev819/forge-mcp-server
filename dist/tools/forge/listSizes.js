@@ -1,0 +1,47 @@
+import { HttpMethod } from '../../core/types/protocols.js';
+import { toMCPToolResult, toMCPToolError } from '../../utils/mcpToolResult.js';
+import { callForgeApi } from '../../utils/forgeApi.js';
+import { z } from 'zod';
+const paramsSchema = {
+    provider: z
+        .string()
+        .describe('The provider ID to list sizes for (e.g., ocean2, akamai, vultr2, aws, hetzner, custom)'),
+    region: z
+        .string()
+        .describe('The region ID to list sizes for (e.g., ams2, fra1, etc.)'),
+};
+const paramsZodObject = z.object(paramsSchema);
+export const listSizesTool = {
+    name: 'list_sizes',
+    parameters: paramsSchema,
+    annotations: {
+        title: 'List Sizes',
+        description: 'List available sizes for a given provider and region using the Forge API. Also allows custom/free-text entry.',
+        operation: 'list',
+        resource: 'sizes',
+        safe: true,
+        readOnlyHint: true,
+        openWorldHint: true,
+        readWriteHint: false,
+        destructiveHint: false
+    },
+    handler: async (params, forgeApiKey) => {
+        try {
+            const parsed = paramsZodObject.parse(params);
+            const provider = parsed.provider;
+            const region = parsed.region;
+            // Fetch all regions from Forge API
+            const data = await callForgeApi({
+                endpoint: '/regions',
+                method: HttpMethod.GET,
+            }, forgeApiKey);
+            const providerRegions = data?.regions?.[provider] || [];
+            const regionObj = providerRegions.find(r => r.id === region);
+            const sizes = regionObj?.sizes || [];
+            return toMCPToolResult({ sizes, allowCustom: true });
+        }
+        catch (err) {
+            return toMCPToolError(err);
+        }
+    },
+};

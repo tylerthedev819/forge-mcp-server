@@ -1,0 +1,42 @@
+import { HttpMethod } from '../../core/types/protocols.js';
+import { callForgeApi } from '../../utils/forgeApi.js';
+import { toMCPToolResult, toMCPToolError } from '../../utils/mcpToolResult.js';
+import { z } from 'zod';
+const paramsSchema = {
+    serverId: z
+        .string()
+        .describe('The ID of the server. The client MUST validate this value against the available servers from listServersTool before passing it.'),
+    databaseId: z
+        .string()
+        .describe('The ID of the database. The client MUST validate this value against the available databases from listDatabasesTool before passing it.'),
+};
+const paramsZodObject = z.object(paramsSchema);
+export const getDatabaseTool = {
+    name: 'get_database',
+    parameters: paramsSchema,
+    annotations: {
+        title: 'Get Database',
+        description: 'Get details for a specific database on a server in your Laravel Forge account.',
+        operation: 'get',
+        resource: 'database',
+        safe: true,
+        readOnlyHint: true,
+        openWorldHint: true,
+        readWriteHint: false,
+        destructiveHint: false
+    },
+    handler: async (params, forgeApiKey) => {
+        try {
+            const parsed = paramsZodObject.parse(params);
+            const { serverId, databaseId } = parsed;
+            const data = await callForgeApi({
+                endpoint: `/servers/${String(serverId)}/databases/${String(databaseId)}`,
+                method: HttpMethod.GET,
+            }, forgeApiKey);
+            return toMCPToolResult(data);
+        }
+        catch (err) {
+            return toMCPToolError(err);
+        }
+    },
+};
