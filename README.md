@@ -9,6 +9,7 @@ For more information about the Laravel Forge API, see the [official API document
 - Comprehensive Laravel Forge API integration
 - Health check tool: `test_connection`
 - Extensive tool coverage for server and site management
+- **WordPress installation support** - Install WordPress on sites via the Forge API
 - Built on Laravel Forge's official API
 
 ## Prerequisites
@@ -209,6 +210,31 @@ Or in `claude_desktop_config.json`:
 - `clear_site_log` - Clear site logs
 - `create_lets_encrypt_certificate` - Create Let's Encrypt certificate
 - `activate_certificate` - Activate a certificate
+- `install_wordpress` - Install WordPress on an existing PHP site
+- `uninstall_wordpress` - Uninstall WordPress from a site
+
+### WordPress Installation
+
+The server includes tools to install WordPress on existing PHP sites using the Forge API's WordPress endpoint. This is the same functionality available in the Forge UI when selecting "WordPress" as the project type.
+
+**Workflow:**
+1. Create a PHP site using `create_site` with `projectType: "php"`
+2. Create a database using `create_database`
+3. Create a database user using `create_database_user`
+4. Install WordPress using `install_wordpress` with the site ID, database name, and database user
+5. Visit the site URL to complete the WordPress setup wizard
+
+**Example usage with Claude:**
+```
+"Create a new WordPress site called example.com on server Zambit-Test"
+```
+
+Claude will:
+1. Create the PHP site
+2. Create a database (e.g., `example_db`)
+3. Create a database user with access to that database
+4. Call the WordPress installation endpoint
+5. Provide you with the URL to complete setup
 
 
 
