@@ -38,6 +38,13 @@ const paramsSchema = {
     .describe(
       'The database user ID (integer) for WordPress. The client MUST get this ID from listDatabaseUsersTool. This is the numeric ID of the user, not the username string.'
     ),
+  clearExistingApp: z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe(
+      'Whether to automatically clear any existing application (including default site page) before installing WordPress. Defaults to true. When true, calls the uninstall WordPress endpoint first to reset the site state, allowing WordPress to be installed on sites that already have an app deployed.'
+    ),
 }
 
 export const installWordPressConfirmationStore =
@@ -60,13 +67,15 @@ export const confirmInstallWordPressTool: ForgeToolDefinition<typeof paramsSchem
     destructiveHint: false
   },
   handler: async params => {
-    const entry = createConfirmation(installWordPressConfirmationStore, params)
+    const clearExistingApp = params.clearExistingApp ?? true
+    const entry = createConfirmation(installWordPressConfirmationStore, { ...params, clearExistingApp })
     const summary =
       `Please confirm WordPress installation with the following settings:\n` +
       `Server: ${params.serverName} (ID: ${params.serverId})\n` +
       `Site: ${params.siteName} (ID: ${params.siteId})\n` +
       `Database: ${params.database}\n` +
       `Database User ID: ${params.userId}\n` +
+      `Clear Existing App: ${clearExistingApp ? 'Yes (will remove any existing app/default page first)' : 'No'}\n` +
       `Confirmation ID: ${entry.confirmationId}\n` +
       `\nType "yes" to confirm or "no" to cancel.`
     return toMCPToolResult({ summary, confirmationId: entry.confirmationId })
