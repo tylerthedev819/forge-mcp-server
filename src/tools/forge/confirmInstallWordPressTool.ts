@@ -20,13 +20,14 @@ const paramsSchema = {
     ),
   siteId: z
     .string()
+    .optional()
     .describe(
-      'The ID of the site. The client MUST validate this value against the available sites from listSitesTool before passing it.'
+      'The ID of an existing site to delete and recreate with WordPress. If provided along with createFreshSite=true, the site will be deleted first. If createFreshSite=false, WordPress will be installed on this existing site (may fail if site already has an app).'
     ),
   siteName: z
     .string()
     .describe(
-      'The name/domain of the site. The client MUST validate this value against the available sites from listSitesTool before passing it.'
+      'The domain name for the WordPress site (e.g., "example.com"). This will be used as the site name.'
     ),
   database: z
     .string()
@@ -38,13 +39,21 @@ const paramsSchema = {
     .describe(
       'The database user ID (integer) for WordPress. The client MUST get this ID from listDatabaseUsersTool. This is the numeric ID of the user, not the username string.'
     ),
-  clearExistingApp: z
+  createFreshSite: z
     .boolean()
     .optional()
     .default(true)
     .describe(
-      'Whether to automatically clear any existing application (including default site page) before installing WordPress. Defaults to true. When true, calls the uninstall WordPress endpoint first to reset the site state, allowing WordPress to be installed on sites that already have an app deployed.'
+      'Whether to delete any existing site and create a fresh one before installing WordPress. Defaults to true. This is the recommended approach as Forge cannot install WordPress on sites that already have an application deployed (including the default PHP info page). When false, attempts to install on existing site (may fail).'
     ),
+  isolated: z
+    .boolean()
+    .optional()
+    .describe('Whether the site should be isolated (optional). Creates a separate system user for the site.'),
+  phpVersion: z
+    .string()
+    .optional()
+    .describe('The PHP version for the site (optional, e.g., "php84", "php83"). Defaults to server default.'),
 }
 
 export const installWordPressConfirmationStore =
@@ -67,17 +76,35 @@ export const confirmInstallWordPressTool: ForgeToolDefinition<typeof paramsSchem
     destructiveHint: false
   },
   handler: async params => {
-    const clearExistingApp = params.clearExistingApp ?? true
-    const entry = createConfirmation(installWordPressConfirmationStore, { ...params, clearExistingApp })
-    const summary =
-      `Please confirm WordPress installation with the following settings:\n` +
+    const createFreshSite = params.createFreshSite ?? true
+    const entry = createConfirmation(installWordPressConfirmationStore, { ...params, createFreshSite })
+    
+    let summary = `Please confirm WordPress installation with the following settings:\n` +
       `Server: ${params.serverName} (ID: ${params.serverId})\n` +
-      `Site: ${params.siteName} (ID: ${params.siteId})\n` +
-      `Database: ${params.database}\n` +
+      `Site Domain: ${params.siteName}\n`
+    
+    if (params.siteId && createFreshSite) {
+      summary += `Existing Site ID: ${params.siteId} (WILL BE DELETED and recreated)\n`
+    } else if (params.siteId && !createFreshSite) {
+      summary += `Existing Site ID: ${params.siteId} (will attempt install on existing site)\n`
+    } else {
+      summary += `New Site: Yes (will create new site)\n`
+    }
+    
+    summary += `Database: ${params.database}\n` +
       `Database User ID: ${params.userId}\n` +
-      `Clear Existing App: ${clearExistingApp ? 'Yes (will remove any existing app/default page first)' : 'No'}\n` +
-      `Confirmation ID: ${entry.confirmationId}\n` +
+      `Create Fresh Site: ${createFreshSite ? 'Yes (recommended - deletes existing site first)' : 'No (may fail if site has app installed)'}\n`
+    
+    if (params.isolated !== undefined) {
+      summary += `Isolated: ${params.isolated ? 'Yes' : 'No'}\n`
+    }
+    if (params.phpVersion) {
+      summary += `PHP Version: ${params.phpVersion}\n`
+    }
+    
+    summary += `Confirmation ID: ${entry.confirmationId}\n` +
       `\nType "yes" to confirm or "no" to cancel.`
+    
     return toMCPToolResult({ summary, confirmationId: entry.confirmationId })
   },
 }
