@@ -18,9 +18,9 @@ const paramsSchema = {
     database: z
         .string()
         .describe('The name of the database to use for WordPress. The client MUST validate this value against the available databases from listDatabasesTool before passing it.'),
-    user: z
-        .string()
-        .describe('The database user for WordPress. The client MUST validate this value against the available database users from listDatabaseUsersTool before passing it.'),
+    userId: z
+        .number()
+        .describe('The database user ID (integer) for WordPress. The client MUST get this ID from listDatabaseUsersTool. This is the numeric ID of the user, not the username string.'),
 };
 export const installWordPressConfirmationStore = createConfirmationStore();
 const baseDescription = 'Confirms the WordPress installation parameters and returns a summary for user confirmation.';
@@ -44,7 +44,7 @@ export const confirmInstallWordPressTool = {
             `Server: ${params.serverName} (ID: ${params.serverId})\n` +
             `Site: ${params.siteName} (ID: ${params.siteId})\n` +
             `Database: ${params.database}\n` +
-            `Database User: ${params.user}\n` +
+            `Database User ID: ${params.userId}\n` +
             `Confirmation ID: ${entry.confirmationId}\n` +
             `\nType "yes" to confirm or "no" to cancel.`;
         return toMCPToolResult({ summary, confirmationId: entry.confirmationId });
