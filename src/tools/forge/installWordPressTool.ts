@@ -7,7 +7,6 @@ import {
   validateConfirmation,
   markConfirmationUsed,
 } from '../../utils/confirmationStore.js'
-import { executeCommandInternal } from './executeSiteCommandTool.js'
 
 const paramsSchema = {
   serverId: z.string().describe('The ID of the server.'),
@@ -43,32 +42,110 @@ const paramsSchema = {
 
 const paramsZodObject = z.object(paramsSchema)
 
-// Helper to wait for site to be ready
-async function waitForSiteReady(
+// Helper to wait for site to exist (not necessarily fully installed)
+async function waitForSiteToExist(
   serverId: string,
   siteId: string,
   forgeApiKey: string,
-  maxAttempts = 30,
-  delayMs = 2000
+  maxAttempts = 10,
+  delayMs = 1000
 ): Promise<boolean> {
   for (let i = 0; i < maxAttempts; i++) {
     try {
-      const response = await callForgeApi<{ site: { status: string } }>(
+      const response = await callForgeApi<{ site: { id: number; status: string } }>(
         {
           endpoint: `/servers/${serverId}/sites/${siteId}`,
           method: HttpMethod.GET,
         },
         forgeApiKey
       )
-      if (response.site?.status === 'installed') {
+      // Site exists if we get a response with an id
+      if (response.site?.id) {
         return true
+      }
+    } catch (e) {
+      // Site doesn't exist yet, keep waiting
+    }
+    await new Promise(resolve => setTimeout(resolve, delayMs))
+  }
+  return false
+}
+
+// Helper to wait for WordPress installation to complete
+async function waitForWordPressReady(
+  serverId: string,
+  siteId: string,
+  forgeApiKey: string,
+  maxAttempts = 60,
+  delayMs = 3000
+): Promise<{ ready: boolean; site?: Record<string, unknown> }> {
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      const response = await callForgeApi<{ site: Record<string, unknown> }>(
+        {
+          endpoint: `/servers/${serverId}/sites/${siteId}`,
+          method: HttpMethod.GET,
+        },
+        forgeApiKey
+      )
+      // Check if site is installed and has WordPress app
+      if (
+        response.site?.status === 'installed' &&
+        response.site?.app === 'wordpress'
+      ) {
+        return { ready: true, site: response.site }
       }
     } catch (e) {
       // Ignore errors during polling
     }
     await new Promise(resolve => setTimeout(resolve, delayMs))
   }
-  return false
+  return { ready: false }
+}
+
+// Helper to attempt WordPress installation with retries
+async function attemptWordPressInstall(
+  serverId: string,
+  siteId: string,
+  database: string,
+  userId: number,
+  forgeApiKey: string,
+  maxAttempts = 5,
+  delayMs = 2000
+): Promise<{ success: boolean; data?: object; error?: string }> {
+  const wordpressPayload = {
+    database,
+    user: userId,
+  }
+
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      const data = await callForgeApi<object>(
+        {
+          endpoint: `/servers/${serverId}/sites/${siteId}/wordpress`,
+          method: HttpMethod.POST,
+          data: wordpressPayload,
+        },
+        forgeApiKey
+      )
+      return { success: true, data }
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err)
+      
+      // If it's the "application installed" error, wait and retry
+      if (errorMessage.includes('application installed')) {
+        if (i < maxAttempts - 1) {
+          await new Promise(resolve => setTimeout(resolve, delayMs))
+          continue
+        }
+      }
+      
+      // For other errors or final attempt, return the error
+      return { success: false, error: errorMessage }
+    }
+  }
+  
+  return { success: false, error: 'Max retry attempts reached' }
 }
 
 export const installWordPressTool: ForgeToolDefinition<typeof paramsSchema> = {
@@ -81,11 +158,11 @@ export const installWordPressTool: ForgeToolDefinition<typeof paramsSchema> = {
 This tool handles the full WordPress installation workflow:
 1. If an existing siteId is provided and createFreshSite is true: deletes the existing site
 2. Creates a new PHP site with the specified domain
-3. Waits for the site to be ready
-4. **Clears the default files from the public directory** (this is the key fix!)
-5. Installs WordPress using the specified database and user
+3. **IMMEDIATELY** calls the WordPress installation API (before Forge marks the site as having an app)
+4. Waits for WordPress installation to complete
 
-This approach is necessary because Forge cannot install WordPress on sites that already have an application deployed (including the default PHP info page that Forge creates on new sites). By clearing the public directory first, we work around this API limitation.
+The key to this approach is calling the WordPress API immediately after site creation,
+during the brief window before Forge's internal state marks the site as having an application.
 
 IMPORTANT: The userId parameter must be the numeric database user ID (integer) from list_database_users, NOT the username string.
 
@@ -136,8 +213,8 @@ Before calling this tool, the client MUST call the 'confirm_install_wordpress' t
               },
               forgeApiKey
             )
-            // Wait a bit for deletion to complete
-            await new Promise(resolve => setTimeout(resolve, 3000))
+            // Wait for deletion to complete
+            await new Promise(resolve => setTimeout(resolve, 5000))
           } catch (deleteError) {
             // Ignore deletion errors - site might not exist
           }
@@ -166,37 +243,52 @@ Before calling this tool, the client MUST call the 'confirm_install_wordpress' t
 
         newSiteId = String(createResponse.site.id)
 
-        // Step 3: Wait for site to be ready
-        const isReady = await waitForSiteReady(serverId, newSiteId, forgeApiKey)
-        if (!isReady) {
-          return toMCPToolError(new Error('Timed out waiting for site to be ready'))
+        // Step 3: Wait briefly for site to exist in Forge's system
+        const siteExists = await waitForSiteToExist(serverId, newSiteId, forgeApiKey)
+        if (!siteExists) {
+          return toMCPToolError(new Error('Site was created but could not be found'))
         }
 
-        // Small additional delay to ensure Forge has fully initialized the site
-        await new Promise(resolve => setTimeout(resolve, 2000))
-
-        // Step 4: Clear the public directory to remove the default index.php
-        // This is the KEY FIX - the default index.php triggers the "application installed" check
-        const clearCommand = `rm -rf /home/forge/${siteName}/public/*`
-        const clearResult = await executeCommandInternal(
+        // Step 4: IMMEDIATELY attempt WordPress installation
+        // This is the key change - we don't wait for site to be fully "installed"
+        // We try to install WordPress right away, before Forge marks it as having an app
+        const wpResult = await attemptWordPressInstall(
           serverId,
           newSiteId,
-          clearCommand,
-          forgeApiKey,
-          true // wait for completion
+          database,
+          userId,
+          forgeApiKey
         )
 
-        if (!clearResult.success) {
+        if (!wpResult.success) {
           return toMCPToolError(
-            new Error(
-              `Failed to clear default files from public directory: ${clearResult.error || 'Unknown error'}. ` +
-              `This step is required before WordPress can be installed.`
-            )
+            new Error(`WordPress installation failed: ${wpResult.error}`)
           )
         }
 
-        // Small delay after clearing files
-        await new Promise(resolve => setTimeout(resolve, 1000))
+        // Step 5: Wait for WordPress to be fully installed
+        const wpReady = await waitForWordPressReady(serverId, newSiteId, forgeApiKey)
+        
+        if (!wpReady.ready) {
+          // WordPress API call succeeded but installation is still in progress
+          // This is not necessarily an error - just return success with a note
+          return toMCPToolResult({
+            success: true,
+            message: `WordPress installation initiated on site ${siteName} (ID: ${newSiteId}). Installation is in progress. Visit the site URL to complete the WordPress setup wizard once installation finishes.`,
+            siteId: newSiteId,
+            data: wpResult.data,
+            status: 'installing',
+          })
+        }
+
+        return toMCPToolResult({
+          success: true,
+          message: `WordPress successfully installed on site ${siteName} (ID: ${newSiteId}). Visit the site URL to complete the WordPress setup wizard.`,
+          siteId: newSiteId,
+          site: wpReady.site,
+          data: wpResult.data,
+          status: 'installed',
+        })
 
       } else {
         // Use existing site (may fail if it has an app installed)
@@ -204,29 +296,29 @@ Before calling this tool, the client MUST call the 'confirm_install_wordpress' t
           return toMCPToolError(new Error('siteId is required when createFreshSite is false'))
         }
         newSiteId = siteId
+
+        // Try to install WordPress on existing site
+        const wpResult = await attemptWordPressInstall(
+          serverId,
+          newSiteId,
+          database,
+          userId,
+          forgeApiKey
+        )
+
+        if (!wpResult.success) {
+          return toMCPToolError(
+            new Error(`WordPress installation failed: ${wpResult.error}`)
+          )
+        }
+
+        return toMCPToolResult({
+          success: true,
+          message: `WordPress installation initiated on site ${siteName} (ID: ${newSiteId}). Visit the site URL to complete the WordPress setup wizard.`,
+          siteId: newSiteId,
+          data: wpResult.data,
+        })
       }
-
-      // Step 5: Install WordPress
-      const wordpressPayload = {
-        database,
-        user: userId,
-      }
-
-      const data = await callForgeApi<object>(
-        {
-          endpoint: `/servers/${serverId}/sites/${newSiteId}/wordpress`,
-          method: HttpMethod.POST,
-          data: wordpressPayload,
-        },
-        forgeApiKey
-      )
-
-      return toMCPToolResult({
-        success: true,
-        message: `WordPress installation initiated on site ${siteName} (ID: ${newSiteId}). Visit the site URL to complete the WordPress setup wizard.`,
-        siteId: newSiteId,
-        data,
-      })
     } catch (err) {
       return toMCPToolError(err)
     }
