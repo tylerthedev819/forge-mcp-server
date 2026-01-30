@@ -69,6 +69,11 @@ import { confirmInstallWordPressTool } from './confirmInstallWordPressTool.js';
 import { installWordPressTool } from './installWordPressTool.js';
 import { confirmUninstallWordPressTool } from './confirmUninstallWordPressTool.js';
 import { uninstallWordPressTool } from './uninstallWordPressTool.js';
+// Site Command tools (NEW)
+import { confirmExecuteSiteCommandTool } from './confirmExecuteSiteCommandTool.js';
+import { executeSiteCommandTool } from './executeSiteCommandTool.js';
+import { getSiteCommandTool } from './getSiteCommandTool.js';
+import { listSiteCommandsTool } from './listSiteCommandsTool.js';
 // Import other tools here as you add them
 // Categorize tools based on their functionality
 // READONLY: Safe read operations that don't modify anything
@@ -110,6 +115,9 @@ export const forgeTools = [
     getCertificateTool,
     getSiteEnvTool,
     getSiteLogTool,
+    // Site Commands - Read-only
+    getSiteCommandTool,
+    listSiteCommandsTool,
     // WRITE TOOLS (Creation and Modification)
     confirmServerCreationTool,
     createServerTool,
@@ -148,6 +156,9 @@ export const forgeTools = [
     installWordPressTool,
     confirmUninstallWordPressTool,
     uninstallWordPressTool,
+    // Site Commands - Execute (requires confirmation)
+    confirmExecuteSiteCommandTool,
+    executeSiteCommandTool,
     // DESTRUCTIVE TOOLS (Deletion) - UNDER DEVELOPMENT
     // These tools are currently disabled due to the high risk involved in destructive operations.
     // They may be enabled in future releases after thorough testing and safety measures.
