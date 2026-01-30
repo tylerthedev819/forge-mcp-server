@@ -42,7 +42,6 @@ const paramsSchema = {
   createFreshSite: z
     .boolean()
     .optional()
-    .default(true)
     .describe(
       'Whether to delete any existing site and create a fresh one before installing WordPress. Defaults to true. This is the recommended approach as Forge cannot install WordPress on sites that already have an application deployed (including the default PHP info page). When false, attempts to install on existing site (may fail).'
     ),
@@ -56,8 +55,21 @@ const paramsSchema = {
     .describe('The PHP version for the site (optional, e.g., "php84", "php83"). Defaults to server default.'),
 }
 
+// Define the shape of data stored in the confirmation store
+interface WordPressConfirmationData {
+  serverId: string
+  serverName: string
+  siteId?: string
+  siteName: string
+  database: string
+  userId: number
+  createFreshSite: boolean
+  isolated?: boolean
+  phpVersion?: string
+}
+
 export const installWordPressConfirmationStore =
-  createConfirmationStore<Omit<typeof paramsSchema, never>>()
+  createConfirmationStore<WordPressConfirmationData>()
 
 const baseDescription = 'Confirms the WordPress installation parameters and returns a summary for user confirmation.'
 
@@ -77,7 +89,21 @@ export const confirmInstallWordPressTool: ForgeToolDefinition<typeof paramsSchem
   },
   handler: async params => {
     const createFreshSite = params.createFreshSite ?? true
-    const entry = createConfirmation(installWordPressConfirmationStore, { ...params, createFreshSite })
+    
+    // Build the confirmation data with explicit typing
+    const confirmationData: WordPressConfirmationData = {
+      serverId: params.serverId,
+      serverName: params.serverName,
+      siteName: params.siteName,
+      database: params.database,
+      userId: params.userId,
+      createFreshSite,
+      siteId: params.siteId,
+      isolated: params.isolated,
+      phpVersion: params.phpVersion,
+    }
+    
+    const entry = createConfirmation(installWordPressConfirmationStore, confirmationData)
     
     let summary = `Please confirm WordPress installation with the following settings:\n` +
       `Server: ${params.serverName} (ID: ${params.serverId})\n` +
