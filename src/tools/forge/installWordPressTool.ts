@@ -42,35 +42,6 @@ const paramsSchema = {
 
 const paramsZodObject = z.object(paramsSchema)
 
-// Helper to wait for site to exist (not necessarily fully installed)
-async function waitForSiteToExist(
-  serverId: string,
-  siteId: string,
-  forgeApiKey: string,
-  maxAttempts = 10,
-  delayMs = 1000
-): Promise<boolean> {
-  for (let i = 0; i < maxAttempts; i++) {
-    try {
-      const response = await callForgeApi<{ site: { id: number; status: string } }>(
-        {
-          endpoint: `/servers/${serverId}/sites/${siteId}`,
-          method: HttpMethod.GET,
-        },
-        forgeApiKey
-      )
-      // Site exists if we get a response with an id
-      if (response.site?.id) {
-        return true
-      }
-    } catch (e) {
-      // Site doesn't exist yet, keep waiting
-    }
-    await new Promise(resolve => setTimeout(resolve, delayMs))
-  }
-  return false
-}
-
 // Helper to wait for WordPress installation to complete
 async function waitForWordPressReady(
   serverId: string,
@@ -103,15 +74,15 @@ async function waitForWordPressReady(
   return { ready: false }
 }
 
-// Helper to attempt WordPress installation with retries
+// Helper to attempt WordPress installation with retries - NO DELAY on first attempt
 async function attemptWordPressInstall(
   serverId: string,
   siteId: string,
   database: string,
   userId: number,
   forgeApiKey: string,
-  maxAttempts = 5,
-  delayMs = 2000
+  maxAttempts = 10,
+  delayMs = 500
 ): Promise<{ success: boolean; data?: object; error?: string }> {
   const wordpressPayload = {
     database,
@@ -132,7 +103,7 @@ async function attemptWordPressInstall(
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err)
       
-      // If it's the "application installed" error, wait and retry
+      // If it's the "application installed" error, wait briefly and retry
       if (errorMessage.includes('application installed')) {
         if (i < maxAttempts - 1) {
           await new Promise(resolve => setTimeout(resolve, delayMs))
@@ -158,11 +129,11 @@ export const installWordPressTool: ForgeToolDefinition<typeof paramsSchema> = {
 This tool handles the full WordPress installation workflow:
 1. If an existing siteId is provided and createFreshSite is true: deletes the existing site
 2. Creates a new PHP site with the specified domain
-3. **IMMEDIATELY** calls the WordPress installation API (before Forge marks the site as having an app)
+3. **IMMEDIATELY** calls the WordPress installation API (no waiting - this is critical!)
 4. Waits for WordPress installation to complete
 
-The key to this approach is calling the WordPress API immediately after site creation,
-during the brief window before Forge's internal state marks the site as having an application.
+The key to this approach is calling the WordPress API IMMEDIATELY after site creation,
+with zero delay, to try to beat Forge's internal state update that marks the site as having an application.
 
 IMPORTANT: The userId parameter must be the numeric database user ID (integer) from list_database_users, NOT the username string.
 
@@ -243,15 +214,8 @@ Before calling this tool, the client MUST call the 'confirm_install_wordpress' t
 
         newSiteId = String(createResponse.site.id)
 
-        // Step 3: Wait briefly for site to exist in Forge's system
-        const siteExists = await waitForSiteToExist(serverId, newSiteId, forgeApiKey)
-        if (!siteExists) {
-          return toMCPToolError(new Error('Site was created but could not be found'))
-        }
-
-        // Step 4: IMMEDIATELY attempt WordPress installation
-        // This is the key change - we don't wait for site to be fully "installed"
-        // We try to install WordPress right away, before Forge marks it as having an app
+        // Step 3: IMMEDIATELY attempt WordPress installation - NO WAITING!
+        // This is critical - we must call the WordPress API before Forge marks the site as having an app
         const wpResult = await attemptWordPressInstall(
           serverId,
           newSiteId,
@@ -266,7 +230,7 @@ Before calling this tool, the client MUST call the 'confirm_install_wordpress' t
           )
         }
 
-        // Step 5: Wait for WordPress to be fully installed
+        // Step 4: Wait for WordPress to be fully installed
         const wpReady = await waitForWordPressReady(serverId, newSiteId, forgeApiKey)
         
         if (!wpReady.ready) {
