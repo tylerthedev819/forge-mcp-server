@@ -25,7 +25,6 @@ const paramsSchema = {
     createFreshSite: z
         .boolean()
         .optional()
-        .default(true)
         .describe('Whether to delete any existing site and create a fresh one before installing WordPress. Defaults to true. This is the recommended approach as Forge cannot install WordPress on sites that already have an application deployed (including the default PHP info page). When false, attempts to install on existing site (may fail).'),
     isolated: z
         .boolean()
@@ -36,6 +35,8 @@ const paramsSchema = {
         .optional()
         .describe('The PHP version for the site (optional, e.g., "php84", "php83"). Defaults to server default.'),
 };
+const paramsZodObject = z.object(paramsSchema);
+// Confirmation store uses Record<string, unknown> for compatibility
 export const installWordPressConfirmationStore = createConfirmationStore();
 const baseDescription = 'Confirms the WordPress installation parameters and returns a summary for user confirmation.';
 export const confirmInstallWordPressTool = {
@@ -53,28 +54,43 @@ export const confirmInstallWordPressTool = {
         destructiveHint: false
     },
     handler: async (params) => {
-        const createFreshSite = params.createFreshSite ?? true;
-        const entry = createConfirmation(installWordPressConfirmationStore, { ...params, createFreshSite });
+        // Parse params with Zod to get typed values
+        const parsed = paramsZodObject.parse(params);
+        const { serverId, serverName, siteId, siteName, database, userId, isolated, phpVersion } = parsed;
+        const createFreshSite = parsed.createFreshSite ?? true;
+        // Build the confirmation data
+        const confirmationData = {
+            serverId,
+            serverName,
+            siteName,
+            database,
+            userId,
+            createFreshSite,
+            siteId,
+            isolated,
+            phpVersion,
+        };
+        const entry = createConfirmation(installWordPressConfirmationStore, confirmationData);
         let summary = `Please confirm WordPress installation with the following settings:\n` +
-            `Server: ${params.serverName} (ID: ${params.serverId})\n` +
-            `Site Domain: ${params.siteName}\n`;
-        if (params.siteId && createFreshSite) {
-            summary += `Existing Site ID: ${params.siteId} (WILL BE DELETED and recreated)\n`;
+            `Server: ${serverName} (ID: ${serverId})\n` +
+            `Site Domain: ${siteName}\n`;
+        if (siteId && createFreshSite) {
+            summary += `Existing Site ID: ${siteId} (WILL BE DELETED and recreated)\n`;
         }
-        else if (params.siteId && !createFreshSite) {
-            summary += `Existing Site ID: ${params.siteId} (will attempt install on existing site)\n`;
+        else if (siteId && !createFreshSite) {
+            summary += `Existing Site ID: ${siteId} (will attempt install on existing site)\n`;
         }
         else {
             summary += `New Site: Yes (will create new site)\n`;
         }
-        summary += `Database: ${params.database}\n` +
-            `Database User ID: ${params.userId}\n` +
+        summary += `Database: ${database}\n` +
+            `Database User ID: ${userId}\n` +
             `Create Fresh Site: ${createFreshSite ? 'Yes (recommended - deletes existing site first)' : 'No (may fail if site has app installed)'}\n`;
-        if (params.isolated !== undefined) {
-            summary += `Isolated: ${params.isolated ? 'Yes' : 'No'}\n`;
+        if (isolated !== undefined) {
+            summary += `Isolated: ${isolated ? 'Yes' : 'No'}\n`;
         }
-        if (params.phpVersion) {
-            summary += `PHP Version: ${params.phpVersion}\n`;
+        if (phpVersion) {
+            summary += `PHP Version: ${phpVersion}\n`;
         }
         summary += `Confirmation ID: ${entry.confirmationId}\n` +
             `\nType "yes" to confirm or "no" to cancel.`;

@@ -52,6 +52,116 @@ async function waitForSiteReady(serverId, siteId, forgeApiKey, maxAttempts = 30,
     }
     return false;
 }
+// Helper to wait for WordPress installation to complete
+async function waitForWordPressInstalled(serverId, siteId, forgeApiKey, maxAttempts = 60, delayMs = 2000) {
+    for (let i = 0; i < maxAttempts; i++) {
+        try {
+            const response = await callForgeApi({
+                endpoint: `/servers/${serverId}/sites/${siteId}`,
+                method: HttpMethod.GET,
+            }, forgeApiKey);
+            // WordPress is installed when app is 'wordpress' and app_status is 'installed'
+            if (response.site?.app === 'wordpress' && response.site?.app_status === 'installed') {
+                return true;
+            }
+            // Also check if app_status indicates failure
+            if (response.site?.app_status === 'failed') {
+                return false;
+            }
+        }
+        catch (e) {
+            // Ignore errors during polling
+        }
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+    return false;
+}
+// Helper to get database user name by ID
+async function getDatabaseUserName(serverId, userId, forgeApiKey) {
+    try {
+        const response = await callForgeApi({
+            endpoint: `/servers/${serverId}/database-users/${userId}`,
+            method: HttpMethod.GET,
+        }, forgeApiKey);
+        return response.user?.name || null;
+    }
+    catch (e) {
+        return null;
+    }
+}
+// Try to install WordPress using Forge's official API
+async function tryForgeWordPressApi(serverId, siteId, database, userId, forgeApiKey) {
+    try {
+        await callForgeApi({
+            endpoint: `/servers/${serverId}/sites/${siteId}/wordpress`,
+            method: HttpMethod.POST,
+            data: {
+                database: database,
+                user: userId,
+            },
+        }, forgeApiKey);
+        // Wait for WordPress to be installed
+        const installed = await waitForWordPressInstalled(serverId, siteId, forgeApiKey);
+        if (installed) {
+            return { success: true };
+        }
+        return { success: false, error: 'WordPress installation timed out or failed' };
+    }
+    catch (e) {
+        const errorMessage = e instanceof Error ? e.message : String(e);
+        return { success: false, error: errorMessage };
+    }
+}
+// Manual WordPress installation using direct download
+async function manualWordPressInstall(serverId, siteId, siteName, database, dbUsername, forgeApiKey) {
+    const siteDir = `/home/forge/${siteName}`;
+    const publicDir = `${siteDir}/public`;
+    try {
+        // Clear public directory
+        const clearResult = await executeCommandInternal(serverId, siteId, `rm -rf ${publicDir}/* ${publicDir}/.[!.]* 2>/dev/null; echo "Cleared"`, forgeApiKey, true);
+        if (!clearResult.success) {
+            return { success: false, error: `Failed to clear public directory: ${clearResult.error}` };
+        }
+        // Download WordPress using curl and extract it
+        const downloadCmd = `cd ${publicDir} && curl -sS https://wordpress.org/latest.tar.gz | tar xz --strip-components=1`;
+        const downloadResult = await executeCommandInternal(serverId, siteId, downloadCmd, forgeApiKey, true);
+        if (!downloadResult.success) {
+            return { success: false, error: `Failed to download WordPress: ${downloadResult.error}` };
+        }
+        // Create wp-config.php with database settings
+        const wpConfigCmd = `cd ${publicDir} && cp wp-config-sample.php wp-config.php && \
+      sed -i "s/database_name_here/${database}/" wp-config.php && \
+      sed -i "s/username_here/${dbUsername}/" wp-config.php && \
+      sed -i "s/password_here/YOUR_DB_PASSWORD_HERE/" wp-config.php && \
+      sed -i "s/localhost/127.0.0.1/" wp-config.php`;
+        const configResult = await executeCommandInternal(serverId, siteId, wpConfigCmd, forgeApiKey, true);
+        if (!configResult.success) {
+            return { success: false, error: `Failed to configure wp-config.php: ${configResult.error}` };
+        }
+        // Generate and set security keys using WP salt API
+        const saltCmd = `cd ${publicDir} && \
+      SALT=$(curl -sS https://api.wordpress.org/secret-key/1.1/salt/) && \
+      sed -i "/define( 'AUTH_KEY'/d" wp-config.php && \
+      sed -i "/define( 'SECURE_AUTH_KEY'/d" wp-config.php && \
+      sed -i "/define( 'LOGGED_IN_KEY'/d" wp-config.php && \
+      sed -i "/define( 'NONCE_KEY'/d" wp-config.php && \
+      sed -i "/define( 'AUTH_SALT'/d" wp-config.php && \
+      sed -i "/define( 'SECURE_AUTH_SALT'/d" wp-config.php && \
+      sed -i "/define( 'LOGGED_IN_SALT'/d" wp-config.php && \
+      sed -i "/define( 'NONCE_SALT'/d" wp-config.php && \
+      sed -i "/put your unique phrase here/d" wp-config.php && \
+      echo "$SALT" >> wp-config.php || true`;
+        await executeCommandInternal(serverId, siteId, saltCmd, forgeApiKey, true);
+        // Set proper permissions
+        const permCmd = `chown -R forge:forge ${publicDir} && chmod -R 755 ${publicDir}`;
+        await executeCommandInternal(serverId, siteId, permCmd, forgeApiKey, true);
+        return { success: true };
+    }
+    catch (e) {
+        const errorMessage = e instanceof Error ? e.message : String(e);
+        return { success: false, error: errorMessage };
+    }
+}
 export const installWordPressTool = {
     name: 'install_wordpress',
     parameters: paramsSchema,
@@ -96,6 +206,11 @@ Before calling this tool, the client MUST call the 'confirm_install_wordpress' t
                 return toMCPToolResult(false);
             }
             markConfirmationUsed(installWordPressConfirmationStore, confirmationId);
+            // Get the database username from the userId (needed for manual install fallback)
+            const dbUsername = await getDatabaseUserName(serverId, userId, forgeApiKey);
+            if (!dbUsername) {
+                return toMCPToolError(new Error(`Could not find database user with ID ${userId}`));
+            }
             let newSiteId;
             if (createFreshSite !== false) {
                 // Step 1: Delete existing site if siteId provided
@@ -105,8 +220,8 @@ Before calling this tool, the client MUST call the 'confirm_install_wordpress' t
                             endpoint: `/servers/${serverId}/sites/${siteId}`,
                             method: HttpMethod.DELETE,
                         }, forgeApiKey);
-                        // Wait a bit for deletion to complete
-                        await new Promise(resolve => setTimeout(resolve, 3000));
+                        // Wait for deletion to complete
+                        await new Promise(resolve => setTimeout(resolve, 5000));
                     }
                     catch (deleteError) {
                         // Ignore deletion errors - site might not exist
@@ -134,42 +249,64 @@ Before calling this tool, the client MUST call the 'confirm_install_wordpress' t
                 if (!isReady) {
                     return toMCPToolError(new Error('Timed out waiting for site to be ready'));
                 }
-                // Small additional delay to ensure Forge has fully initialized the site
-                await new Promise(resolve => setTimeout(resolve, 2000));
-                // Step 4: Clear the public directory to remove the default index.php
-                // This is the KEY FIX - the default index.php triggers the "application installed" check
-                const clearCommand = `rm -rf /home/forge/${siteName}/public/*`;
-                const clearResult = await executeCommandInternal(serverId, newSiteId, clearCommand, forgeApiKey, true // wait for completion
-                );
-                if (!clearResult.success) {
-                    return toMCPToolError(new Error(`Failed to clear default files from public directory: ${clearResult.error || 'Unknown error'}. ` +
-                        `This step is required before WordPress can be installed.`));
-                }
-                // Small delay after clearing files
-                await new Promise(resolve => setTimeout(resolve, 1000));
+                // Additional delay to ensure site is fully provisioned
+                await new Promise(resolve => setTimeout(resolve, 3000));
             }
             else {
-                // Use existing site (may fail if it has an app installed)
+                // Use existing site
                 if (!siteId) {
                     return toMCPToolError(new Error('siteId is required when createFreshSite is false'));
                 }
                 newSiteId = siteId;
             }
-            // Step 5: Install WordPress
-            const wordpressPayload = {
-                database,
-                user: userId,
-            };
-            const data = await callForgeApi({
-                endpoint: `/servers/${serverId}/sites/${newSiteId}/wordpress`,
-                method: HttpMethod.POST,
-                data: wordpressPayload,
-            }, forgeApiKey);
+            // Step 4: Clear the public directory first to reset site state
+            // This is crucial - Forge's WordPress API won't work if the site has any app deployed
+            const siteDir = `/home/forge/${siteName}`;
+            const publicDir = `${siteDir}/public`;
+            const clearResult = await executeCommandInternal(serverId, newSiteId, `rm -rf ${publicDir}/* ${publicDir}/.[!.]* 2>/dev/null; echo "Cleared"`, forgeApiKey, true);
+            if (!clearResult.success) {
+                return toMCPToolError(new Error(`Failed to clear public directory: ${clearResult.error}`));
+            }
+            // Small delay after clearing
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            // Step 5: Try Forge's official WordPress API first
+            const apiResult = await tryForgeWordPressApi(serverId, newSiteId, database, userId, forgeApiKey);
+            if (apiResult.success) {
+                return toMCPToolResult({
+                    success: true,
+                    message: `WordPress has been successfully installed on site ${siteName} (ID: ${newSiteId}) using Forge's official API.
+
+Visit https://${siteName} to complete the WordPress setup wizard.`,
+                    siteId: newSiteId,
+                    siteUrl: `https://${siteName}`,
+                    database: database,
+                    dbUser: dbUsername,
+                    method: 'forge-api'
+                });
+            }
+            // Step 6: Fallback to manual installation if API fails
+            console.log(`Forge API WordPress installation failed: ${apiResult.error}. Falling back to manual installation.`);
+            const manualResult = await manualWordPressInstall(serverId, newSiteId, siteName, database, dbUsername, forgeApiKey);
+            if (!manualResult.success) {
+                return toMCPToolError(new Error(`Both Forge API and manual WordPress installation failed.\nAPI error: ${apiResult.error}\nManual error: ${manualResult.error}`));
+            }
             return toMCPToolResult({
                 success: true,
-                message: `WordPress installation initiated on site ${siteName} (ID: ${newSiteId}). Visit the site URL to complete the WordPress setup wizard.`,
+                message: `WordPress has been downloaded and installed on site ${siteName} (ID: ${newSiteId}) using manual installation.
+
+IMPORTANT: You need to update the database password in wp-config.php:
+1. SSH into the server or use Forge's file editor
+2. Edit /home/forge/${siteName}/public/wp-config.php
+3. Replace 'YOUR_DB_PASSWORD_HERE' with the actual database password
+
+Then visit https://${siteName} to complete the WordPress setup wizard.`,
                 siteId: newSiteId,
-                data,
+                siteUrl: `https://${siteName}`,
+                wpConfigPath: `${publicDir}/wp-config.php`,
+                database: database,
+                dbUser: dbUsername,
+                method: 'manual',
+                note: 'Database password needs to be set manually in wp-config.php'
             });
         }
         catch (err) {
