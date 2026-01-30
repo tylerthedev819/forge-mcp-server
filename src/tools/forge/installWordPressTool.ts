@@ -7,6 +7,7 @@ import {
   validateConfirmation,
   markConfirmationUsed,
 } from '../../utils/confirmationStore.js'
+import { executeCommandInternal } from './executeSiteCommandTool.js'
 
 const paramsSchema = {
   serverId: z.string().describe('The ID of the server.'),
@@ -81,9 +82,10 @@ This tool handles the full WordPress installation workflow:
 1. If an existing siteId is provided and createFreshSite is true: deletes the existing site
 2. Creates a new PHP site with the specified domain
 3. Waits for the site to be ready
-4. Installs WordPress using the specified database and user
+4. **Clears the default files from the public directory** (this is the key fix!)
+5. Installs WordPress using the specified database and user
 
-This approach is necessary because Forge cannot install WordPress on sites that already have an application deployed (including the default PHP info page that Forge creates on new sites).
+This approach is necessary because Forge cannot install WordPress on sites that already have an application deployed (including the default PHP info page that Forge creates on new sites). By clearing the public directory first, we work around this API limitation.
 
 IMPORTANT: The userId parameter must be the numeric database user ID (integer) from list_database_users, NOT the username string.
 
@@ -172,6 +174,30 @@ Before calling this tool, the client MUST call the 'confirm_install_wordpress' t
 
         // Small additional delay to ensure Forge has fully initialized the site
         await new Promise(resolve => setTimeout(resolve, 2000))
+
+        // Step 4: Clear the public directory to remove the default index.php
+        // This is the KEY FIX - the default index.php triggers the "application installed" check
+        const clearCommand = `rm -rf /home/forge/${siteName}/public/*`
+        const clearResult = await executeCommandInternal(
+          serverId,
+          newSiteId,
+          clearCommand,
+          forgeApiKey,
+          true // wait for completion
+        )
+
+        if (!clearResult.success) {
+          return toMCPToolError(
+            new Error(
+              `Failed to clear default files from public directory: ${clearResult.error || 'Unknown error'}. ` +
+              `This step is required before WordPress can be installed.`
+            )
+          )
+        }
+
+        // Small delay after clearing files
+        await new Promise(resolve => setTimeout(resolve, 1000))
+
       } else {
         // Use existing site (may fail if it has an app installed)
         if (!siteId) {
@@ -180,7 +206,7 @@ Before calling this tool, the client MUST call the 'confirm_install_wordpress' t
         newSiteId = siteId
       }
 
-      // Step 4: Install WordPress
+      // Step 5: Install WordPress
       const wordpressPayload = {
         database,
         user: userId,
