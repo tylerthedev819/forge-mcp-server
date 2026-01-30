@@ -7,6 +7,7 @@ import {
   validateConfirmation,
   markConfirmationUsed,
 } from '../../utils/confirmationStore.js'
+import { executeCommandInternal } from './executeSiteCommandTool.js'
 
 const paramsSchema = {
   serverId: z.string().describe('The ID of the server.'),
@@ -42,81 +43,52 @@ const paramsSchema = {
 
 const paramsZodObject = z.object(paramsSchema)
 
-// Helper to wait for WordPress installation to complete
-async function waitForWordPressReady(
+// Helper to wait for site to be ready
+async function waitForSiteReady(
   serverId: string,
   siteId: string,
   forgeApiKey: string,
-  maxAttempts = 60,
-  delayMs = 3000
-): Promise<{ ready: boolean; site?: Record<string, unknown> }> {
+  maxAttempts = 30,
+  delayMs = 2000
+): Promise<boolean> {
   for (let i = 0; i < maxAttempts; i++) {
     try {
-      const response = await callForgeApi<{ site: Record<string, unknown> }>(
+      const response = await callForgeApi<{ site: { status: string } }>(
         {
           endpoint: `/servers/${serverId}/sites/${siteId}`,
           method: HttpMethod.GET,
         },
         forgeApiKey
       )
-      // Check if site is installed and has WordPress app
-      if (
-        response.site?.status === 'installed' &&
-        response.site?.app === 'wordpress'
-      ) {
-        return { ready: true, site: response.site }
+      if (response.site?.status === 'installed') {
+        return true
       }
     } catch (e) {
       // Ignore errors during polling
     }
     await new Promise(resolve => setTimeout(resolve, delayMs))
   }
-  return { ready: false }
+  return false
 }
 
-// Helper to attempt WordPress installation with retries - NO DELAY on first attempt
-async function attemptWordPressInstall(
+// Helper to get database user name by ID
+async function getDatabaseUserName(
   serverId: string,
-  siteId: string,
-  database: string,
   userId: number,
-  forgeApiKey: string,
-  maxAttempts = 10,
-  delayMs = 500
-): Promise<{ success: boolean; data?: object; error?: string }> {
-  const wordpressPayload = {
-    database,
-    user: userId,
+  forgeApiKey: string
+): Promise<string | null> {
+  try {
+    const response = await callForgeApi<{ user: { name: string } }>(
+      {
+        endpoint: `/servers/${serverId}/database-users/${userId}`,
+        method: HttpMethod.GET,
+      },
+      forgeApiKey
+    )
+    return response.user?.name || null
+  } catch (e) {
+    return null
   }
-
-  for (let i = 0; i < maxAttempts; i++) {
-    try {
-      const data = await callForgeApi<object>(
-        {
-          endpoint: `/servers/${serverId}/sites/${siteId}/wordpress`,
-          method: HttpMethod.POST,
-          data: wordpressPayload,
-        },
-        forgeApiKey
-      )
-      return { success: true, data }
-    } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : String(err)
-      
-      // If it's the "application installed" error, wait briefly and retry
-      if (errorMessage.includes('application installed')) {
-        if (i < maxAttempts - 1) {
-          await new Promise(resolve => setTimeout(resolve, delayMs))
-          continue
-        }
-      }
-      
-      // For other errors or final attempt, return the error
-      return { success: false, error: errorMessage }
-    }
-  }
-  
-  return { success: false, error: 'Max retry attempts reached' }
 }
 
 export const installWordPressTool: ForgeToolDefinition<typeof paramsSchema> = {
@@ -124,16 +96,17 @@ export const installWordPressTool: ForgeToolDefinition<typeof paramsSchema> = {
   parameters: paramsSchema,
   annotations: {
     title: 'Install WordPress',
-    description: `Installs WordPress on a Laravel Forge server by creating a fresh site and installing WordPress.
+    description: `Installs WordPress on a Laravel Forge server using WP-CLI (manual installation).
 
 This tool handles the full WordPress installation workflow:
 1. If an existing siteId is provided and createFreshSite is true: deletes the existing site
 2. Creates a new PHP site with the specified domain
-3. **IMMEDIATELY** calls the WordPress installation API (no waiting - this is critical!)
-4. Waits for WordPress installation to complete
+3. Waits for the site to be ready
+4. Downloads and installs WordPress using WP-CLI commands
+5. Configures wp-config.php with database credentials
 
-The key to this approach is calling the WordPress API IMMEDIATELY after site creation,
-with zero delay, to try to beat Forge's internal state update that marks the site as having an application.
+NOTE: This uses manual WP-CLI installation because Forge's WordPress API endpoint
+has a limitation that prevents it from working on sites created via API.
 
 IMPORTANT: The userId parameter must be the numeric database user ID (integer) from list_database_users, NOT the username string.
 
@@ -170,6 +143,12 @@ Before calling this tool, the client MUST call the 'confirm_install_wordpress' t
         return toMCPToolResult(false)
       }
       markConfirmationUsed(installWordPressConfirmationStore, confirmationId)
+
+      // Get the database username from the userId
+      const dbUsername = await getDatabaseUserName(serverId, userId, forgeApiKey)
+      if (!dbUsername) {
+        return toMCPToolError(new Error(`Could not find database user with ID ${userId}`))
+      }
 
       let newSiteId: string
 
@@ -214,75 +193,126 @@ Before calling this tool, the client MUST call the 'confirm_install_wordpress' t
 
         newSiteId = String(createResponse.site.id)
 
-        // Step 3: IMMEDIATELY attempt WordPress installation - NO WAITING!
-        // This is critical - we must call the WordPress API before Forge marks the site as having an app
-        const wpResult = await attemptWordPressInstall(
-          serverId,
-          newSiteId,
-          database,
-          userId,
-          forgeApiKey
-        )
-
-        if (!wpResult.success) {
-          return toMCPToolError(
-            new Error(`WordPress installation failed: ${wpResult.error}`)
-          )
+        // Step 3: Wait for site to be ready
+        const isReady = await waitForSiteReady(serverId, newSiteId, forgeApiKey)
+        if (!isReady) {
+          return toMCPToolError(new Error('Timed out waiting for site to be ready'))
         }
 
-        // Step 4: Wait for WordPress to be fully installed
-        const wpReady = await waitForWordPressReady(serverId, newSiteId, forgeApiKey)
-        
-        if (!wpReady.ready) {
-          // WordPress API call succeeded but installation is still in progress
-          // This is not necessarily an error - just return success with a note
-          return toMCPToolResult({
-            success: true,
-            message: `WordPress installation initiated on site ${siteName} (ID: ${newSiteId}). Installation is in progress. Visit the site URL to complete the WordPress setup wizard once installation finishes.`,
-            siteId: newSiteId,
-            data: wpResult.data,
-            status: 'installing',
-          })
-        }
-
-        return toMCPToolResult({
-          success: true,
-          message: `WordPress successfully installed on site ${siteName} (ID: ${newSiteId}). Visit the site URL to complete the WordPress setup wizard.`,
-          siteId: newSiteId,
-          site: wpReady.site,
-          data: wpResult.data,
-          status: 'installed',
-        })
+        // Additional delay to ensure site is fully provisioned
+        await new Promise(resolve => setTimeout(resolve, 3000))
 
       } else {
-        // Use existing site (may fail if it has an app installed)
+        // Use existing site
         if (!siteId) {
           return toMCPToolError(new Error('siteId is required when createFreshSite is false'))
         }
         newSiteId = siteId
-
-        // Try to install WordPress on existing site
-        const wpResult = await attemptWordPressInstall(
-          serverId,
-          newSiteId,
-          database,
-          userId,
-          forgeApiKey
-        )
-
-        if (!wpResult.success) {
-          return toMCPToolError(
-            new Error(`WordPress installation failed: ${wpResult.error}`)
-          )
-        }
-
-        return toMCPToolResult({
-          success: true,
-          message: `WordPress installation initiated on site ${siteName} (ID: ${newSiteId}). Visit the site URL to complete the WordPress setup wizard.`,
-          siteId: newSiteId,
-          data: wpResult.data,
-        })
       }
+
+      // Step 4: Install WordPress using WP-CLI
+      // First, clear the public directory and download WordPress
+      const siteDir = `/home/forge/${siteName}`
+      const publicDir = `${siteDir}/public`
+
+      // Clear public directory
+      const clearResult = await executeCommandInternal(
+        serverId,
+        newSiteId,
+        `rm -rf ${publicDir}/* ${publicDir}/.[!.]* 2>/dev/null; echo "Cleared"`,
+        forgeApiKey,
+        true
+      )
+
+      if (!clearResult.success) {
+        return toMCPToolError(new Error(`Failed to clear public directory: ${clearResult.error}`))
+      }
+
+      // Download WordPress using curl and extract it
+      const downloadCmd = `cd ${publicDir} && curl -sS https://wordpress.org/latest.tar.gz | tar xz --strip-components=1`
+      const downloadResult = await executeCommandInternal(
+        serverId,
+        newSiteId,
+        downloadCmd,
+        forgeApiKey,
+        true
+      )
+
+      if (!downloadResult.success) {
+        return toMCPToolError(new Error(`Failed to download WordPress: ${downloadResult.error}`))
+      }
+
+      // Step 5: Create wp-config.php
+      // We need to get database password from the environment or use a placeholder
+      // Since we don't have the password, we'll create a basic wp-config that needs manual setup
+      const wpConfigCmd = `cd ${publicDir} && cp wp-config-sample.php wp-config.php && \\
+        sed -i "s/database_name_here/${database}/" wp-config.php && \\
+        sed -i "s/username_here/${dbUsername}/" wp-config.php && \\
+        sed -i "s/password_here/YOUR_DB_PASSWORD_HERE/" wp-config.php && \\
+        sed -i "s/localhost/127.0.0.1/" wp-config.php`
+      
+      const configResult = await executeCommandInternal(
+        serverId,
+        newSiteId,
+        wpConfigCmd,
+        forgeApiKey,
+        true
+      )
+
+      if (!configResult.success) {
+        return toMCPToolError(new Error(`Failed to configure wp-config.php: ${configResult.error}`))
+      }
+
+      // Generate and set security keys using WP salt API
+      const saltCmd = `cd ${publicDir} && \\
+        SALT=$(curl -sS https://api.wordpress.org/secret-key/1.1/salt/) && \\
+        printf '%s\\n' "g/put your unique phrase here/d" "w" | ed -s wp-config.php 2>/dev/null; \\
+        sed -i "/define( 'AUTH_KEY'/d" wp-config.php && \\
+        sed -i "/define( 'SECURE_AUTH_KEY'/d" wp-config.php && \\
+        sed -i "/define( 'LOGGED_IN_KEY'/d" wp-config.php && \\
+        sed -i "/define( 'NONCE_KEY'/d" wp-config.php && \\
+        sed -i "/define( 'AUTH_SALT'/d" wp-config.php && \\
+        sed -i "/define( 'SECURE_AUTH_SALT'/d" wp-config.php && \\
+        sed -i "/define( 'LOGGED_IN_SALT'/d" wp-config.php && \\
+        sed -i "/define( 'NONCE_SALT'/d" wp-config.php && \\
+        sed -i "/@-/r /dev/stdin" wp-config.php <<< "$SALT" || true`
+
+      await executeCommandInternal(
+        serverId,
+        newSiteId,
+        saltCmd,
+        forgeApiKey,
+        true
+      )
+
+      // Set proper permissions
+      const permCmd = `chown -R forge:forge ${publicDir} && chmod -R 755 ${publicDir}`
+      await executeCommandInternal(
+        serverId,
+        newSiteId,
+        permCmd,
+        forgeApiKey,
+        true
+      )
+
+      return toMCPToolResult({
+        success: true,
+        message: `WordPress has been downloaded and installed on site ${siteName} (ID: ${newSiteId}).
+
+IMPORTANT: You need to update the database password in wp-config.php:
+1. SSH into the server or use Forge's file editor
+2. Edit /home/forge/${siteName}/public/wp-config.php
+3. Replace 'YOUR_DB_PASSWORD_HERE' with the actual database password
+
+Then visit https://${siteName} to complete the WordPress setup wizard.`,
+        siteId: newSiteId,
+        siteUrl: `https://${siteName}`,
+        wpConfigPath: `${publicDir}/wp-config.php`,
+        database: database,
+        dbUser: dbUsername,
+        note: 'Database password needs to be set manually in wp-config.php'
+      })
+
     } catch (err) {
       return toMCPToolError(err)
     }
