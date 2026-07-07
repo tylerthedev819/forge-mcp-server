@@ -73,7 +73,12 @@ WARNING: Shell commands have full access to the site's filesystem and can be des
         readOnlyHint: false,
         openWorldHint: true,
         readWriteHint: true,
-        destructiveHint: true,
+        // Classified as a "write" tool (not "destructive") so it is enabled by
+        // the standard `--tools=readonly,write` configuration. Command execution
+        // can be destructive, but that risk is gated by the mandatory
+        // confirm_execute_site_command step and the warning in the description
+        // above, not by the category tier.
+        destructiveHint: false,
     },
     handler: async (params, forgeApiKey) => {
         try {

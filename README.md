@@ -116,15 +116,17 @@ Then add the following to your `claude_desktop_config.json`:
 
 ## Tool Categories & Access Control
 
-All tools are grouped into two categories:
+All tools are grouped into three categories:
 
 - **Readonly**: Safe, non-modifying operations (e.g., listing, viewing, status checks).
-- **Write**: Operations that create or modify resources (e.g., create, update, reboot, enable/disable features).
+- **Write**: Operations that create or modify resources (e.g., create, update, reboot, enable/disable features, execute site commands).
+- **Destructive**: Operations that delete or irreversibly remove resources (e.g., delete a server, site, database, or certificate; uninstall WordPress; remove a site's Git repository).
 
-By default, **only readonly tools are enabled**. To enable write tools, use the `--tools` flag:
+By default, **only readonly tools are enabled**. To enable additional tools, use the `--tools` flag (each level includes the ones before it):
 
 - `--tools=readonly` (default)
 - `--tools=readonly,write` (enables readonly and write tools)
+- `--tools=readonly,write,destructive` (also enables destructive tools)
 
 **Example:**
 
@@ -211,6 +213,15 @@ Or in `claude_desktop_config.json`:
 - `create_lets_encrypt_certificate` - Create Let's Encrypt certificate
 - `activate_certificate` - Activate a certificate
 - `install_wordpress` - Install WordPress on an existing PHP site
+- `execute_site_command` - Execute a shell command on a site (gated by a mandatory confirmation step)
+
+### Destructive Tools
+- `delete_server` - Delete a server
+- `delete_site` - Delete a site
+- `delete_database` - Delete a database
+- `delete_database_user` - Delete a database user
+- `delete_certificate` - Delete an SSL certificate
+- `remove_site_git` - Remove a site's Git repository
 - `uninstall_wordpress` - Uninstall WordPress from a site
 
 ### WordPress Installation
