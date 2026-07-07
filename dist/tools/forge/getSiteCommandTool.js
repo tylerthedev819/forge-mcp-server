@@ -26,7 +26,9 @@ This is useful for:
 - Retrieving the output of a previously executed command
 - Debugging failed commands
 
-The response includes the command status ('installing', 'finished', 'failed') and the output.`,
+The response includes the command status ('installing', 'finished', 'failed'), the exit_code, error_output, and the output.
+
+Note: Forge populates a command's stdout a few seconds after its status becomes 'finished'. If the output field contains a message like "cat: /home/.../.forge/provision-<id>.output: No such file or directory", the stdout is not ready yet — call this tool again shortly to retrieve it. The status and exit_code are authoritative as soon as the status is terminal.`,
         operation: 'get',
         resource: 'site_command',
         safe: true,

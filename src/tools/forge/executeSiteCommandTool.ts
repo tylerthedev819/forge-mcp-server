@@ -17,6 +17,12 @@ interface SiteCommand {
   event_id: number
   command: string
   status: string
+  // exit_code, error_output and duration are the authoritative signals of how a
+  // command actually went. They are reliably populated the moment the status is
+  // terminal, unlike `output` (see waitForCommandCompletion for why).
+  exit_code?: number | null
+  error_output?: string | null
+  duration?: string | null
   created_at: string
   updated_at: string
   profile_photo_url?: string
@@ -53,7 +59,7 @@ const paramsSchema = {
     .optional()
     .default(true)
     .describe(
-      'Whether to wait for the command to complete before returning. If true (default), the tool will poll until the command finishes and return the output. If false, returns immediately with the command ID.'
+      'Whether to wait for the command to complete before returning. If true (default), the tool polls until the command reaches a terminal status AND its stdout is retrievable, then returns { status, exitCode, output, errorOutput, duration }. If false, returns immediately with the command ID; use get_site_command to fetch status and output later.'
     ),
   confirmationId: z
     .string()
@@ -64,47 +70,126 @@ const paramsSchema = {
 
 const paramsZodObject = z.object(paramsSchema)
 
+// Statuses at which a command has stopped running.
+const TERMINAL_STATUSES = ['finished', 'failed', 'error']
+
 /**
- * Helper function to wait for a command to complete.
- * Polls the command status until it's "finished" or timeout is reached.
+ * Forge does not stream stdout. It writes each command's combined output to a
+ * `~/.forge/provision-<event_id>.output` file (in the site user's home) and
+ * reads that file back to populate the API's `output` field. That file write
+ * lags a few seconds behind the status flipping to "finished", so an early read
+ * returns the stderr of Forge's own `cat` of the not-yet-written file, e.g.:
+ *
+ *   cat: /home/forge/.forge/provision-199071958.output: No such file or directory
+ *
+ * We treat that signature (and a null/absent body) as "output not ready yet"
+ * and keep polling until the real stdout lands. Verified live: re-reading the
+ * same finished command a few seconds later returns the true output on both
+ * isolated and non-isolated sites.
+ */
+const OUTPUT_NOT_READY_PATTERN =
+  /cat: .*\.forge\/provision-\d+\.output: No such file or directory/
+
+function isOutputReady(output: string | null | undefined): boolean {
+  if (output === null || output === undefined) return false
+  return !OUTPUT_NOT_READY_PATTERN.test(output)
+}
+
+function isTerminalStatus(status: string | undefined): boolean {
+  return status !== undefined && TERMINAL_STATUSES.includes(status)
+}
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise(resolve => setTimeout(resolve, ms))
+
+async function fetchCommand(
+  serverId: string,
+  siteId: string,
+  commandId: number,
+  forgeApiKey: string
+): Promise<GetCommandResponse | null> {
+  try {
+    return await callForgeApi<GetCommandResponse>(
+      {
+        endpoint: `/servers/${serverId}/sites/${siteId}/commands/${commandId}`,
+        method: HttpMethod.GET,
+      },
+      forgeApiKey
+    )
+  } catch {
+    // Ignore transient errors during polling; the caller will retry.
+    return null
+  }
+}
+
+/**
+ * Waits for a command to finish AND for its output to become readable.
+ *
+ * Phase 1 polls until the status is terminal (finished/failed/error).
+ * Phase 2 keeps polling until `output` settles — no longer the transient
+ * "output not ready" signature, and stable across reads (an empty body must
+ * repeat once so a pre-write blank isn't mistaken for a genuinely empty result).
+ *
+ * Returns the last response seen plus `outputReady`, which is false when Phase 2
+ * timed out (status and exit_code are still authoritative in that case).
  */
 async function waitForCommandCompletion(
   serverId: string,
   siteId: string,
   commandId: number,
   forgeApiKey: string,
-  maxAttempts = 30,
-  delayMs = 2000
-): Promise<GetCommandResponse | null> {
-  for (let i = 0; i < maxAttempts; i++) {
-    try {
-      const response = await callForgeApi<GetCommandResponse>(
-        {
-          endpoint: `/servers/${serverId}/sites/${siteId}/commands/${commandId}`,
-          method: HttpMethod.GET,
-        },
-        forgeApiKey
-      )
+  statusTimeoutMs = 120000,
+  outputTimeoutMs = 20000,
+  statusPollMs = 2000,
+  outputPollMs = 1500
+): Promise<{ response: GetCommandResponse; outputReady: boolean } | null> {
+  let last: GetCommandResponse | null = null
 
-      if (response.command?.status === 'finished') {
-        return response
-      }
-
-      // Check for error status
-      if (
-        response.command?.status === 'failed' ||
-        response.command?.status === 'error'
-      ) {
-        return response
-      }
-    } catch (e) {
-      // Ignore errors during polling, continue trying
+  // Phase 1: wait for a terminal status.
+  const statusDeadline = Date.now() + statusTimeoutMs
+  while (Date.now() < statusDeadline) {
+    const response = await fetchCommand(
+      serverId,
+      siteId,
+      commandId,
+      forgeApiKey
+    )
+    if (response) {
+      last = response
+      if (isTerminalStatus(response.command?.status)) break
     }
-
-    await new Promise(resolve => setTimeout(resolve, delayMs))
+    await sleep(statusPollMs)
   }
 
-  return null
+  if (!last || !isTerminalStatus(last.command?.status)) {
+    // Timed out before the command reached a terminal status.
+    return last ? { response: last, outputReady: false } : null
+  }
+
+  // Phase 2: wait for the output-file readback to settle.
+  const outputDeadline = Date.now() + outputTimeoutMs
+  let previousOutput: string | undefined
+  for (;;) {
+    const output = last.output
+    if (isOutputReady(output)) {
+      // Non-empty output is accepted immediately; empty output must repeat once.
+      if ((output && output.length > 0) || output === previousOutput) {
+        return { response: last, outputReady: true }
+      }
+      previousOutput = output
+    }
+    if (Date.now() >= outputDeadline) {
+      return { response: last, outputReady: isOutputReady(last.output) }
+    }
+    await sleep(outputPollMs)
+    const response = await fetchCommand(
+      serverId,
+      siteId,
+      commandId,
+      forgeApiKey
+    )
+    if (response) last = response
+  }
 }
 
 export const executeSiteCommandTool: ForgeToolDefinition<typeof paramsSchema> =
@@ -216,12 +301,27 @@ WARNING: Shell commands have full access to the site's filesystem and can be des
           })
         }
 
+        const cmd = completedCommand.response.command
+        const succeeded =
+          cmd.status === 'finished' && (cmd.exit_code ?? 0) === 0
+
         return toMCPToolResult({
-          success: completedCommand.command.status === 'finished',
-          message: `Command execution ${completedCommand.command.status}`,
+          success: succeeded,
+          message: `Command execution ${cmd.status}`,
           commandId,
-          status: completedCommand.command.status,
-          output: completedCommand.output,
+          status: cmd.status,
+          exitCode: cmd.exit_code ?? null,
+          duration: cmd.duration ?? null,
+          output: completedCommand.outputReady
+            ? completedCommand.response.output
+            : '',
+          errorOutput: cmd.error_output ?? null,
+          ...(completedCommand.outputReady
+            ? {}
+            : {
+                outputWarning:
+                  'Command stdout could not be retrieved from Forge in time (a known lag in Forge’s output capture). The status and exitCode above are authoritative; call get_site_command again shortly to fetch the stdout.',
+              }),
         })
       } catch (err) {
         return toMCPToolError(err)
@@ -251,7 +351,9 @@ export async function executeCommandInternal(
   success: boolean
   commandId?: number
   status?: string
+  exitCode?: number | null
   output?: string
+  errorOutput?: string | null
   error?: string
 }> {
   try {
@@ -298,11 +400,16 @@ export async function executeCommandInternal(
       }
     }
 
+    const cmd = completedCommand.response.command
     return {
-      success: completedCommand.command.status === 'finished',
+      success: cmd.status === 'finished' && (cmd.exit_code ?? 0) === 0,
       commandId,
-      status: completedCommand.command.status,
-      output: completedCommand.output,
+      status: cmd.status,
+      exitCode: cmd.exit_code ?? null,
+      output: completedCommand.outputReady
+        ? completedCommand.response.output
+        : '',
+      errorOutput: cmd.error_output ?? null,
     }
   } catch (err) {
     return {
