@@ -237,7 +237,7 @@ The server includes tools to install WordPress on existing PHP sites using the F
 
 **Example usage with Claude:**
 ```
-"Create a new WordPress site called example.com on server Zambit-Test"
+"Create a new WordPress site called example.com on a server"
 ```
 
 Claude will:
