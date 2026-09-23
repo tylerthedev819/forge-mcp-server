@@ -1,5 +1,8 @@
-import { ForgeToolDefinition, HttpMethod } from '../../core/types/protocols.js'
-import { callForgeApi } from '../../utils/forgeApi.js'
+import { ForgeToolDefinition } from '../../core/types/protocols.js'
+import {
+  getSiteCommand,
+  getSiteCommandOutput,
+} from '../../utils/siteCommands.js'
 import { toMCPToolResult, toMCPToolError } from '../../utils/mcpToolResult.js'
 import { z } from 'zod'
 
@@ -35,9 +38,9 @@ This is useful for:
 - Retrieving the output of a previously executed command
 - Debugging failed commands
 
-The response includes the command status ('installing', 'finished', 'failed'), the exit_code, error_output, and the output.
+The response includes the command text, status ('waiting', 'running', 'finished', 'failed'), exitCode, errorOutput, duration, timestamps, and output (the command's stdout).
 
-Note: Forge populates a command's stdout a few seconds after its status becomes 'finished'. If the output field contains a message like "cat: /home/.../.forge/provision-<id>.output: No such file or directory", the stdout is not ready yet — call this tool again shortly to retrieve it. The status and exit_code are authoritative as soon as the status is terminal.`,
+Note: output can lag a few seconds behind the status becoming 'finished'. If output is null, or contains a message like "cat: /home/.../.forge/provision-<id>.output: No such file or directory", the stdout is not ready yet — call this tool again shortly. The status and exitCode are authoritative as soon as the status is terminal.`,
     operation: 'get',
     resource: 'site_command',
     safe: true,
@@ -51,15 +54,38 @@ Note: Forge populates a command's stdout a few seconds after its status becomes 
       const parsed = paramsZodObject.parse(params)
       const { serverId, siteId, commandId } = parsed
 
-      const data = await callForgeApi<object>(
-        {
-          endpoint: `/servers/${serverId}/sites/${siteId}/commands/${commandId}`,
-          method: HttpMethod.GET,
-        },
-        forgeApiKey
-      )
+      const cmd = await getSiteCommand(serverId, siteId, commandId, forgeApiKey)
+      if (!cmd) {
+        return toMCPToolError(
+          new Error(`Command ${commandId} not found or unreadable`)
+        )
+      }
 
-      return toMCPToolResult(data)
+      // v2 serves stdout from its own endpoint; a failed read shouldn't hide
+      // the status fields, so report it as not-yet-available instead.
+      let output: string | null = null
+      try {
+        output = await getSiteCommandOutput(
+          serverId,
+          siteId,
+          commandId,
+          forgeApiKey
+        )
+      } catch {
+        output = null
+      }
+
+      return toMCPToolResult({
+        id: cmd.id,
+        command: cmd.command ?? null,
+        status: cmd.status ?? null,
+        exitCode: cmd.exit_code ?? null,
+        errorOutput: cmd.error_output ?? null,
+        duration: cmd.duration ?? null,
+        createdAt: cmd.created_at ?? null,
+        updatedAt: cmd.updated_at ?? null,
+        output,
+      })
     } catch (err) {
       return toMCPToolError(err)
     }
