@@ -1,5 +1,4 @@
-import { ForgeToolDefinition, HttpMethod } from '../../core/types/protocols.js'
-import { callForgeApi } from '../../utils/forgeApi.js'
+import { ForgeToolDefinition } from '../../core/types/protocols.js'
 import { toMCPToolResult, toMCPToolError } from '../../utils/mcpToolResult.js'
 import { z } from 'zod'
 import { executeSiteCommandConfirmationStore } from './confirmExecuteSiteCommandTool.js'
@@ -7,36 +6,14 @@ import {
   validateConfirmation,
   markConfirmationUsed,
 } from '../../utils/confirmationStore.js'
-
-// Response types for the Forge API
-interface SiteCommand {
-  id: number
-  server_id: number
-  site_id: number
-  user_id: number
-  event_id: number
-  command: string
-  status: string
-  // exit_code, error_output and duration are the authoritative signals of how a
-  // command actually went. They are reliably populated the moment the status is
-  // terminal, unlike `output` (see waitForCommandCompletion for why).
-  exit_code?: number | null
-  error_output?: string | null
-  duration?: string | null
-  created_at: string
-  updated_at: string
-  profile_photo_url?: string
-  user_name?: string
-}
-
-interface ExecuteCommandResponse {
-  command: SiteCommand
-}
-
-interface GetCommandResponse {
-  command: SiteCommand
-  output: string
-}
+import {
+  SiteCommand,
+  createSiteCommand,
+  getSiteCommand,
+  getSiteCommandOutput,
+  listSiteCommands,
+  parseSiteCommand,
+} from '../../utils/siteCommands.js'
 
 const paramsSchema = {
   serverId: z
@@ -74,18 +51,15 @@ const paramsZodObject = z.object(paramsSchema)
 const TERMINAL_STATUSES = ['finished', 'failed', 'error']
 
 /**
- * Forge does not stream stdout. It writes each command's combined output to a
- * `~/.forge/provision-<event_id>.output` file (in the site user's home) and
- * reads that file back to populate the API's `output` field. That file write
- * lags a few seconds behind the status flipping to "finished", so an early read
- * returns the stderr of Forge's own `cat` of the not-yet-written file, e.g.:
+ * Forge captures a command's stdout to a `~/.forge/provision-<event_id>.output`
+ * file and serves it back through the API. That readback can lag a few seconds
+ * behind the status flipping to "finished"; an early read has returned the
+ * stderr of Forge's own `cat` of the not-yet-written file, e.g.:
  *
  *   cat: /home/forge/.forge/provision-199071958.output: No such file or directory
  *
- * We treat that signature (and a null/absent body) as "output not ready yet"
- * and keep polling until the real stdout lands. Verified live: re-reading the
- * same finished command a few seconds later returns the true output on both
- * isolated and non-isolated sites.
+ * We treat that signature (and a missing body) as "output not ready yet" and
+ * keep polling until the real stdout lands.
  */
 const OUTPUT_NOT_READY_PATTERN =
   /cat: .*\.forge\/provision-\d+\.output: No such file or directory/
@@ -102,22 +76,11 @@ function isTerminalStatus(status: string | undefined): boolean {
 const sleep = (ms: number): Promise<void> =>
   new Promise(resolve => setTimeout(resolve, ms))
 
-async function fetchCommand(
-  serverId: string,
-  siteId: string,
-  commandId: number,
-  forgeApiKey: string
-): Promise<GetCommandResponse | null> {
+// Polling tolerates transient errors; the caller retries on the next tick.
+async function tryGet<T>(fn: () => Promise<T>): Promise<T | null> {
   try {
-    return await callForgeApi<GetCommandResponse>(
-      {
-        endpoint: `/servers/${serverId}/sites/${siteId}/commands/${commandId}`,
-        method: HttpMethod.GET,
-      },
-      forgeApiKey
-    )
+    return await fn()
   } catch {
-    // Ignore transient errors during polling; the caller will retry.
     return null
   }
 }
@@ -125,72 +88,162 @@ async function fetchCommand(
 /**
  * Waits for a command to finish AND for its output to become readable.
  *
- * Phase 1 polls until the status is terminal (finished/failed/error).
- * Phase 2 keeps polling until `output` settles — no longer the transient
- * "output not ready" signature, and stable across reads (an empty body must
- * repeat once so a pre-write blank isn't mistaken for a genuinely empty result).
+ * Phase 1 polls the command until its status is terminal (finished/failed/error).
+ * Phase 2 polls the output endpoint until it settles — present, not the
+ * transient "output not ready" signature, and (if empty) stable across two
+ * reads so a pre-write blank isn't mistaken for a genuinely empty result.
  *
- * Returns the last response seen plus `outputReady`, which is false when Phase 2
- * timed out (status and exit_code are still authoritative in that case).
+ * Returns the last command seen plus its output and `outputReady`, which is
+ * false when Phase 2 timed out (status and exit_code are still authoritative).
  */
 async function waitForCommandCompletion(
   serverId: string,
   siteId: string,
-  commandId: number,
+  commandId: string,
   forgeApiKey: string,
   statusTimeoutMs = 120000,
   outputTimeoutMs = 20000,
   statusPollMs = 2000,
   outputPollMs = 1500
-): Promise<{ response: GetCommandResponse; outputReady: boolean } | null> {
-  let last: GetCommandResponse | null = null
+): Promise<{
+  command: SiteCommand
+  output: string | null
+  outputReady: boolean
+} | null> {
+  let last: SiteCommand | null = null
 
   // Phase 1: wait for a terminal status.
   const statusDeadline = Date.now() + statusTimeoutMs
   while (Date.now() < statusDeadline) {
-    const response = await fetchCommand(
-      serverId,
-      siteId,
-      commandId,
-      forgeApiKey
+    const command = await tryGet(() =>
+      getSiteCommand(serverId, siteId, commandId, forgeApiKey)
     )
-    if (response) {
-      last = response
-      if (isTerminalStatus(response.command?.status)) break
+    if (command) {
+      last = command
+      if (isTerminalStatus(command.status)) break
     }
     await sleep(statusPollMs)
   }
 
-  if (!last || !isTerminalStatus(last.command?.status)) {
+  if (!last || !isTerminalStatus(last.status)) {
     // Timed out before the command reached a terminal status.
-    return last ? { response: last, outputReady: false } : null
+    return last ? { command: last, output: null, outputReady: false } : null
   }
 
-  // Phase 2: wait for the output-file readback to settle.
+  // Phase 2: wait for the output readback to settle.
   const outputDeadline = Date.now() + outputTimeoutMs
   let previousOutput: string | undefined
   for (;;) {
-    const output = last.output
+    const output = await tryGet(() =>
+      getSiteCommandOutput(serverId, siteId, commandId, forgeApiKey)
+    )
     if (isOutputReady(output)) {
       // Non-empty output is accepted immediately; empty output must repeat once.
       if ((output && output.length > 0) || output === previousOutput) {
-        return { response: last, outputReady: true }
+        return { command: last, output, outputReady: true }
       }
-      previousOutput = output
+      previousOutput = output ?? undefined
     }
     if (Date.now() >= outputDeadline) {
-      return { response: last, outputReady: isOutputReady(last.output) }
+      return {
+        command: last,
+        output: isOutputReady(output) ? output : null,
+        outputReady: isOutputReady(output),
+      }
     }
     await sleep(outputPollMs)
-    const response = await fetchCommand(
-      serverId,
-      siteId,
-      commandId,
-      forgeApiKey
-    )
-    if (response) last = response
   }
 }
+
+/**
+ * Resolve the ID of a command we just POSTed.
+ *
+ * Normally it's in the response body (v2: `data.id`). If Forge accepted the
+ * POST but the ID can't be read, the command has still been created, so look
+ * it up by its text among the newest commands rather than reporting a failure
+ * that would invite a duplicate run.
+ */
+async function resolveCreatedCommandId(
+  postResponse: unknown,
+  serverId: string,
+  siteId: string,
+  command: string,
+  forgeApiKey: string
+): Promise<string | null> {
+  const parsed = parseSiteCommand(postResponse)
+  if (parsed) return parsed.id
+
+  const recent = await tryGet(() =>
+    listSiteCommands(serverId, siteId, forgeApiKey, 5)
+  )
+  return recent?.commands.find(c => c.command === command)?.id ?? null
+}
+
+interface RunResult {
+  submitted: boolean
+  commandId: string | null
+  status?: string
+  command?: SiteCommand
+  output?: string | null
+  outputReady?: boolean
+  timedOut?: boolean
+}
+
+/**
+ * POST the command once, then (optionally) wait for completion and output.
+ * The POST is never retried here: once Forge accepts it, the command runs.
+ */
+async function runSiteCommand(
+  serverId: string,
+  siteId: string,
+  command: string,
+  forgeApiKey: string,
+  waitForCompletion: boolean
+): Promise<RunResult> {
+  const postResponse = await createSiteCommand(
+    serverId,
+    siteId,
+    command,
+    forgeApiKey
+  )
+  const commandId = await resolveCreatedCommandId(
+    postResponse,
+    serverId,
+    siteId,
+    command,
+    forgeApiKey
+  )
+  const initialStatus = parseSiteCommand(postResponse)?.status
+
+  if (!commandId) {
+    return { submitted: true, commandId: null, status: initialStatus }
+  }
+  if (!waitForCompletion) {
+    return { submitted: true, commandId, status: initialStatus }
+  }
+
+  const completed = await waitForCommandCompletion(
+    serverId,
+    siteId,
+    commandId,
+    forgeApiKey
+  )
+  if (!completed) {
+    return { submitted: true, commandId, timedOut: true }
+  }
+  return {
+    submitted: true,
+    commandId,
+    status: completed.command.status,
+    command: completed.command,
+    output: completed.output,
+    outputReady: completed.outputReady,
+    timedOut: !isTerminalStatus(completed.command.status),
+  }
+}
+
+const NO_ID_NOTE =
+  'Forge accepted the command, so it IS running, but its ID could not be read from the response. Do NOT re-run it. Use list_site_commands to find it (newest first).'
 
 export const executeSiteCommandTool: ForgeToolDefinition<typeof paramsSchema> =
   {
@@ -254,73 +307,63 @@ WARNING: Shell commands have full access to the site's filesystem and can be des
           confirmationId
         )
 
-        // Execute the command
-        const executeResponse = await callForgeApi<ExecuteCommandResponse>(
-          {
-            endpoint: `/servers/${serverId}/sites/${siteId}/commands`,
-            method: HttpMethod.POST,
-            data: { command },
-          },
-          forgeApiKey
+        const result = await runSiteCommand(
+          serverId,
+          siteId,
+          command,
+          forgeApiKey,
+          waitForCompletion
         )
 
-        const commandId = executeResponse.command?.id
-
-        if (!commandId) {
-          return toMCPToolError(
-            new Error('Failed to execute command: No command ID returned')
-          )
+        if (!result.commandId) {
+          return toMCPToolResult({
+            success: true,
+            message: 'Command submitted',
+            commandId: null,
+            status: result.status ?? null,
+            note: NO_ID_NOTE,
+          })
         }
 
-        // If not waiting for completion, return immediately
         if (!waitForCompletion) {
           return toMCPToolResult({
             success: true,
             message: 'Command execution started',
-            commandId,
-            status: executeResponse.command.status,
+            commandId: result.commandId,
+            status: result.status ?? null,
             note: 'Use get_site_command to check status and retrieve output',
           })
         }
 
-        // Wait for command to complete
-        const completedCommand = await waitForCommandCompletion(
-          serverId,
-          siteId,
-          commandId,
-          forgeApiKey
-        )
-
-        if (!completedCommand) {
+        if (result.timedOut || !result.command) {
           return toMCPToolResult({
             success: false,
             message:
               'Command execution timed out. The command may still be running.',
-            commandId,
-            note: 'Use get_site_command to check status and retrieve output',
+            commandId: result.commandId,
+            status: result.status ?? null,
+            note: 'Use get_site_command to check status and retrieve output. Do not re-run it.',
           })
         }
 
-        const cmd = completedCommand.response.command
+        const cmd = result.command
         const succeeded =
           cmd.status === 'finished' && (cmd.exit_code ?? 0) === 0
 
         return toMCPToolResult({
           success: succeeded,
           message: `Command execution ${cmd.status}`,
-          commandId,
+          commandId: result.commandId,
           status: cmd.status,
           exitCode: cmd.exit_code ?? null,
           duration: cmd.duration ?? null,
-          output: completedCommand.outputReady
-            ? completedCommand.response.output
-            : '',
+          output: result.outputReady ? result.output : '',
           errorOutput: cmd.error_output ?? null,
-          ...(completedCommand.outputReady
+          ...(result.outputReady
             ? {}
             : {
                 outputWarning:
-                  'Command stdout could not be retrieved from Forge in time (a known lag in Forge’s output capture). The status and exitCode above are authoritative; call get_site_command again shortly to fetch the stdout.',
+                  'Command stdout could not be retrieved from Forge in time. The status and exitCode above are authoritative; call get_site_command again shortly to fetch the stdout.',
               }),
         })
       } catch (err) {
@@ -349,7 +392,7 @@ export async function executeCommandInternal(
   waitForCompletion = true
 ): Promise<{
   success: boolean
-  commandId?: number
+  commandId?: string
   status?: string
   exitCode?: number | null
   output?: string
@@ -357,58 +400,41 @@ export async function executeCommandInternal(
   error?: string
 }> {
   try {
-    // Execute the command
-    const executeResponse = await callForgeApi<ExecuteCommandResponse>(
-      {
-        endpoint: `/servers/${serverId}/sites/${siteId}/commands`,
-        method: HttpMethod.POST,
-        data: { command },
-      },
-      forgeApiKey
+    const result = await runSiteCommand(
+      serverId,
+      siteId,
+      command,
+      forgeApiKey,
+      waitForCompletion
     )
 
-    const commandId = executeResponse.command?.id
-
-    if (!commandId) {
-      return {
-        success: false,
-        error: 'No command ID returned from Forge API',
-      }
+    if (!result.commandId) {
+      return { success: false, status: result.status, error: NO_ID_NOTE }
     }
 
     if (!waitForCompletion) {
       return {
         success: true,
-        commandId,
-        status: executeResponse.command.status,
+        commandId: result.commandId,
+        status: result.status,
       }
     }
 
-    // Wait for command to complete
-    const completedCommand = await waitForCommandCompletion(
-      serverId,
-      siteId,
-      commandId,
-      forgeApiKey
-    )
-
-    if (!completedCommand) {
+    if (result.timedOut || !result.command) {
       return {
         success: false,
-        commandId,
+        commandId: result.commandId,
         error: 'Command execution timed out',
       }
     }
 
-    const cmd = completedCommand.response.command
+    const cmd = result.command
     return {
       success: cmd.status === 'finished' && (cmd.exit_code ?? 0) === 0,
-      commandId,
+      commandId: result.commandId,
       status: cmd.status,
       exitCode: cmd.exit_code ?? null,
-      output: completedCommand.outputReady
-        ? completedCommand.response.output
-        : '',
+      output: result.outputReady ? (result.output ?? '') : '',
       errorOutput: cmd.error_output ?? null,
     }
   } catch (err) {
