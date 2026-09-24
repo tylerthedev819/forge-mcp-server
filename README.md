@@ -1,288 +1,123 @@
 # Forge MCP Server
 
-This is a Model Context Protocol (MCP) server for Laravel Forge integration. It provides comprehensive access to Laravel Forge's official API through MCP-compliant tools, enabling seamless server and site management.
+An MCP server for [Laravel Forge](https://forge.laravel.com) built on Forge API v2. It covers the whole API (except org
+administration) with about 20 grouped tools, and keeps responses small so it is cheap to use every day.
 
-For more information about the Laravel Forge API, see the [official API documentation](https://forge.laravel.com/api-documentation).
+## Highlights
 
-## Features
-- MCP-compliant server
-- Comprehensive Laravel Forge API integration
-- Health check tool: `test_connection`
-- Extensive tool coverage for server and site management
-- **WordPress installation support** - Install WordPress on sites via the Forge API
-- Built on Laravel Forge's official API
+- **Token-efficient.** Lists come back as tab-separated tables with sensible default columns. Logs are tailed and
+  grep-able. Secrets (deploy tokens, private keys) are hidden unless you ask for them. The full tool set is about
+  8–9k tokens of definitions.
+- **Names instead of IDs.** Pass `server: "seniors-plus"` or `site: "seniorsplus.org"`; IDs are resolved and cached.
+- **Careful paging.** One page by default with a note when more exist. `all: true` fetches everything, up to a safety cap.
+- **WP-CLI on every server** through Forge's command API, no SSH key needed, with an automatic database export before
+  risky commands.
+- **Bulk runs** across many sites, with a mandatory preview.
+- **Guarded destructive operations** in a single tool, each needing a preview and a confirmation token.
 
-## Prerequisites
-- Node.js (v18+ recommended)
-- npm (v9+ recommended)
+## Configuration
 
-
-## Configuration & Usage
-
-A **Forge API key is required** for all Forge tool invocations. You must provide it as either:
-- the `FORGE_API_KEY` environment variable, **or**
-- the `--api-key` command-line argument
-
-### Usage with Claude Desktop
-
-Add the following to your `claude_desktop_config.json`. See [here](https://modelcontextprotocol.io/quickstart/user) for more details.
-
-#### Option 1: Using npx (Recommended)
-
-**Using environment variable:**
+Requires Node 18+ and a Forge API token.
 
 ```json
 {
   "mcpServers": {
-    "forge-mcp": {
+    "forge": {
       "command": "npx",
-      "args": [
-        "-y",
-        "@ranium/forge-mcp"
-      ],
-      "env": {
-        "FORGE_API_KEY": "your_forge_api_key_here"
-      }
+      "args": ["-y", "github:tylerthedev819/forge-mcp-server#main", "--tools=destructive"],
+      "env": { "FORGE_API_KEY": "…", "FORGE_ORG": "your-org-slug" }
     }
   }
 }
 ```
 
-**Using command-line argument:**
+`FORGE_ORG` is optional; without it the first organization on the token is used.
 
-```json
-{
-  "mcpServers": {
-    "forge-mcp": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@ranium/forge-mcp",
-        "--api-key=your_forge_api_key_here"
-      ]
-    }
-  }
-}
-```
+### Access levels
 
-#### Option 2: Using node directly
+`--tools=` picks what is exposed. Each level includes the ones before it.
 
-First, clone the repository and build the project:
+| Value | Exposes |
+| --- | --- |
+| `readonly` (default) | Reading only |
+| `write` | Plus creating, updating, deploying, running commands, reboots |
+| `destructive` | Plus `forge_destructive` (deletes, log clearing, backup restores) |
 
-```sh
-git clone https://github.com/ranium/forge-mcp-server
-cd forge_mcp
+Actions that are not enabled are left out of the tool definitions entirely.
+
+### Requiring your approval for destructive operations
+
+`forge_destructive` always previews first and needs a token on the second call, but the model can supply that token
+itself. Make your client ask you before the tool runs:
+
+- **Claude Code:** add `"mcp__forge__forge_destructive"` (use your server's name in place of `forge`) to
+  `permissions.ask` in `~/.claude/settings.json`.
+- **Claude Desktop:** set the tool to "Always ask" in the connector's tool settings.
+
+## Tools
+
+| Tool | What it does |
+| --- | --- |
+| `forge_overview` | Every site (or server) in one compact table. Start here. |
+| `forge_find` | Find servers and sites by partial name, domain, or IP |
+| `forge_servers` | Server details, events, create/update, reboot, power-cycle, restart services |
+| `forge_sites` | Site details, create, settings, git, nginx config, healthcheck, composer/npm credentials |
+| `forge_domains` | Domains, DNS config, domain nginx, SSL certificates (Let's Encrypt by default) |
+| `forge_env` | Read `.env` (optionally selected keys), set individual values, or replace the file |
+| `forge_deployments` | Deploy (optionally waiting for the result), history, logs, script, push-to-deploy, hooks, webhooks, deploy key |
+| `forge_commands` | Run a shell command in a site directory and get its output; command history |
+| `forge_wp` | WP-CLI on any WordPress site by name |
+| `forge_bulk` | Run a WP-CLI or shell command across many sites (preview, then run with a token) |
+| `forge_logs` | Site logs (application, nginx access/error) and server logs, tailed and filtered |
+| `forge_databases` | Databases and database users |
+| `forge_backups` | Backup configurations, backups, run a backup now |
+| `forge_jobs` | Scheduled jobs for servers and sites |
+| `forge_processes` | Background processes / daemons, with logs and restart |
+| `forge_ssh_keys` | Authorize SSH keys on one, several, or all servers, for `forge` or each site user |
+| `forge_security` | Firewall rules, site security rules, redirect rules |
+| `forge_php` | PHP versions and settings (CLI/site default, upload size, execution time, OPcache, FPM/CLI/pool config) |
+| `forge_install_wordpress` | New WordPress site: database, Forge WordPress site, optional `wp core install` |
+| `forge_options` | Providers, regions, sizes, cloud credentials, VPCs; current user and org |
+| `forge_api` | Search a catalog of every endpoint and call any of them (monitors, heartbeats, recipes, integrations, …) |
+| `forge_destructive` | Delete any resource, clear logs, restore a backup (with a safety backup first) |
+
+### WP-CLI backups
+
+`forge_wp` and `forge_bulk` (`kind: wp`) export the site database to `~/mcp-backups/<site>-<timestamp>.sql.gz`
+before commands that change things: plugin/theme/core installs and updates, `search-replace` without `--dry-run`,
+`db import`/`reset`/`query`, and updates or deletes of options, posts, users, and terms. The command only runs if the
+export succeeds. Exports older than 14 days are removed. Use `backup: "always"` or `"never"` to override.
+
+### SSH keys on many servers
+
+`forge_ssh_keys` `add` with `every_server: true` (or `servers: [...]`) and `per_site_user: true` authorizes one key for
+every site user across the fleet. Anything touching more than one server returns a preview and a token first.
+Use a dedicated key for this so it can be revoked on its own.
+
+## Development
+
+```bash
 npm install
 npm run build
+npm test
 ```
 
-Then add the following to your `claude_desktop_config.json`:
+`dist/` is committed so `npx github:…` runs without a build step; rebuild before committing.
+Regenerate the endpoint catalog from Forge's spec with:
 
-**Using environment variable:**
-
-```json
-{
-  "mcpServers": {
-    "forge-mcp": {
-      "command": "node",
-      "args": [
-        "/path/to/forge_mcp/dist/server.js"
-      ],
-      "env": {
-        "FORGE_API_KEY": "your_forge_api_key_here"
-      }
-    }
-  }
-}
+```bash
+curl -o /tmp/forge-openapi.json https://forge.laravel.com/api/docs.openapi
+npm run catalog -- /tmp/forge-openapi.json
 ```
 
-**Using command-line argument:**
-
-```json
-{
-  "mcpServers": {
-    "forge-mcp": {
-      "command": "node",
-      "args": [
-        "/path/to/forge_mcp/dist/server.js",
-        "--api-key=your_forge_api_key_here"
-      ]
-    }
-  }
-}
-```
-
-**Note:** You can use either the `FORGE_API_KEY` environment variable or the `--api-key` argument. If both are provided, the command-line argument takes precedence. Never commit your real API keys to version control. Use environment variables or secrets management in production.
-
-## Tool Categories & Access Control
-
-All tools are grouped into three categories:
-
-- **Readonly**: Safe, non-modifying operations (e.g., listing, viewing, status checks).
-- **Write**: Operations that create or modify resources (e.g., create, update, reboot, enable/disable features, execute site commands).
-- **Destructive**: Operations that delete or irreversibly remove resources (e.g., delete a server, site, database, or certificate; uninstall WordPress; remove a site's Git repository).
-
-By default, **only readonly tools are enabled**. To enable additional tools, use the `--tools` flag (each level includes the ones before it):
-
-- `--tools=readonly` (default)
-- `--tools=readonly,write` (enables readonly and write tools)
-- `--tools=readonly,write,destructive` (also enables destructive tools)
-
-**Example:**
-
-```sh
-npx -y @ranium/forge-mcp --api-key=your_forge_api_key_here --tools=readonly,write
-```
-
-Or in `claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "forge-mcp": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@ranium/forge-mcp",
-        "--api-key=your_forge_api_key_here",
-        "--tools=readonly,write"
-      ]
-    }
-  }
-}
-```
-
-
-
-## Available Tools (by Category)
-
-### Readonly Tools
-- `list_servers` - List all servers
-- `list_static_php_versions` - List static PHP versions
-- `list_php_versions` - List PHP versions
-- `get_user` - Get user information
-- `show_server` - Get detailed information about a specific server
-- `list_sites` - List all sites on a server
-- `show_site` - Get detailed information about a specific site
-- `list_daemons` - List daemons
-- `show_daemon` - Get daemon details
-- `list_deployments` - List deployments
-- `get_deployment_log` - Get deployment logs
-- `get_deployment` - Get deployment details
-- `get_deployment_output` - Get deployment output
-- `get_server_logs` - Get server logs
-- `list_providers` - List cloud providers
-- `list_database_types` - List database types
-- `list_credentials` - List credentials
-- `list_regions` - List available regions
-- `list_ubuntu_versions` - List Ubuntu versions
-- `get_composer_packages_auth` - Get Composer authentication
-- `check_laravel_maintenance_status` - Check Laravel maintenance mode
-- `check_pulse_daemon_status` - Check Pulse daemon status
-- `check_inertia_daemon_status` - Check Inertia daemon status
-- `check_laravel_scheduler_status` - Check Laravel scheduler status
-- `list_sizes` - List server sizes
-- `list_project_types` - List project types
-- `list_databases` - List all databases
-- `get_database` - Get database details
-- `list_database_users` - List database users
-- `get_database_user` - Get database user details
-- `list_certificates` - List SSL certificates
-- `get_certificate` - Get certificate details
-- `get_site_env` - Get site environment file (.env)
-- `get_site_log` - Get site logs
-
-### Write Tools
-- `create_server` - Create a new server
-- `create_database` - Create a new database
-- `sync_database` - Sync database
-- `create_database_user` - Create a new database user
-- `reboot_server` - Reboot a server
-- `reboot_nginx` - Reboot Nginx service
-- `reboot_php` - Reboot PHP service
-- `reboot_mysql` - Reboot MySQL service
-- `reboot_postgres` - Reboot PostgreSQL service
-- `create_site` - Create a new site
-- `install_or_update_site_git` - Install or update Git repository
-- `enable_quick_deployment` - Enable quick deployment
-- `disable_quick_deployment` - Disable quick deployment
-- `deploy_now` - Deploy immediately
-- `change_site_php_version` - Change site PHP version
-- `add_site_aliases` - Add site aliases
-- `clear_site_log` - Clear site logs
-- `create_lets_encrypt_certificate` - Create Let's Encrypt certificate
-- `activate_certificate` - Activate a certificate
-- `install_wordpress` - Install WordPress on an existing PHP site
-- `execute_site_command` - Execute a shell command on a site (gated by a mandatory confirmation step)
-
-### Destructive Tools
-- `delete_server` - Delete a server
-- `delete_site` - Delete a site
-- `delete_database` - Delete a database
-- `delete_database_user` - Delete a database user
-- `delete_certificate` - Delete an SSL certificate
-- `remove_site_git` - Remove a site's Git repository
-- `uninstall_wordpress` - Uninstall WordPress from a site
-
-### WordPress Installation
-
-The server includes tools to install WordPress on existing PHP sites using the Forge API's WordPress endpoint. This is the same functionality available in the Forge UI when selecting "WordPress" as the project type.
-
-**Workflow:**
-1. Create a PHP site using `create_site` with `projectType: "php"`
-2. Create a database using `create_database`
-3. Create a database user using `create_database_user`
-4. Install WordPress using `install_wordpress` with the site ID, database name, and database user
-5. Visit the site URL to complete the WordPress setup wizard
-
-**Example usage with Claude:**
-```
-"Create a new WordPress site called example.com on a server"
-```
-
-Claude will:
-1. Create the PHP site
-2. Create a database (e.g., `example_db`)
-3. Create a database user with access to that database
-4. Call the WordPress installation endpoint
-5. Provide you with the URL to complete setup
-
-
-
-## Screenshots
-
-### Creating a Server
-![Creating a Server](docs/screenshots/create-server.png)
-*Demonstrates the server creation process through the MCP interface*
-
-### Creating a Site
-![Creating a Site](docs/screenshots/create-site.png)
-*Shows how to create a new site on an existing server*
-
-### Rebooting a Server
-![Rebooting a Server](docs/screenshots/reboot-server.png)
-*Illustrates the server reboot functionality*
-
-## Project Structure
-- `src/server.ts` — Main MCP server entry point
-- `src/tools/forge/` — All Forge tool definitions and registry
-- `src/core/types/` — Type definitions and protocols
-- `package.json` — Scripts and dependencies
-- `.gitignore` — Ignores build, env, and dependency files
-
-## Extending (Adding New Tools)
-1. Export a `ForgeToolDefinition` from the new file.
-2. Import and add the tool to the `forgeTools` array in `src/tools/forge/index.ts`.
-3. The tools will be registered when the server starts.
-
----
-
-For more information on MCP, see the [Model Context Protocol documentation](https://modelcontextprotocol.org/).
+Layout: `src/forge/` holds the API client, formatting, name resolution, command runner, and confirmation tokens;
+`src/tools/` holds the tool specs (`define.ts` has the shared helpers and registration logic).
 
 ## Disclaimer
 
-Forge MCP server is an independent product and not officially affiliated with, endorsed by, or sponsored by Laravel or Taylor Otwell. 'Laravel' is a registered trademark owned by Taylor Otwell. Forge MCP server is developed and maintained independently from the official Laravel project.
+Forge MCP server is an independent product and not officially affiliated with, endorsed by, or sponsored by Laravel or
+Taylor Otwell. 'Laravel' is a registered trademark owned by Taylor Otwell.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE.md) file for details.
+MIT. See [LICENSE](LICENSE.md).

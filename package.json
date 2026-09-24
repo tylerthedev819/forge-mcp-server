@@ -1,7 +1,7 @@
 {
   "name": "@raniumsys/forge-mcp",
   "homepage": "https://github.com/ranium/forge-mcp-server",
-  "version": "0.1.10",
+  "version": "1.0.0",
   "description": "MCP Server for Laravel Forge",
   "main": "dist/server.js",
   "bin": "dist/server.js",
@@ -31,23 +31,19 @@
     "lint:fix": "eslint . --ext .ts,.js --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "jest",
+    "test": "NODE_OPTIONS=--experimental-vm-modules jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "catalog": "node scripts/build-catalog.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
-    "@types/node-fetch": "^2.6.12",
-    "axios": "^1.9.0",
-    "dotenv": "^16.3.1",
-    "inquirer": "^12.6.3",
     "node-fetch": "^3.3.2",
     "zod": "^3.22.4"
   },
   "devDependencies": {
     "@eslint/js": "^9.29.0",
-    "@types/axios": "^0.14.4",
     "@types/jest": "^30.0.0",
     "@types/node": "^20.8.0",
     "@typescript-eslint/eslint-plugin": "^8.35.0",
